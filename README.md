@@ -1,6 +1,6 @@
 # Flow Matching and Diffusion Models
 
-Personal repository for experimenting with flow matching and diffusion models, based on the [MIT 6.S184 course](https://diffusion.csail.mit.edu/2026/index.html).
+Personal repository for experimenting with flow matching and diffusion models, based on the [MIT 6.S184 course](https://diffusion.csail.mit.edu/2025/index.html).
 
 ## Overview
 
