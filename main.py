@@ -9,12 +9,11 @@ from matplotlib import pyplot as plt
 
 from base import Sampleable, Trainer, ODE, ConditionalVectorField
 from probability_paths import GaussianConditionalProbabilityPath, LinearAlpha, LinearBeta
-from simulators import EulerSimulator
+from simulators import EulerSimulator, CFGVectorFieldODE
 from models import MNISTUNet
 from utils import visualize_probability_path
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
 
 class MNISTSampler(nn.Module, Sampleable):
     """
@@ -50,24 +49,6 @@ class MNISTSampler(nn.Module, Sampleable):
         samples = torch.stack(samples).to(self.dummy)
         labels = torch.tensor(labels, dtype=torch.int64).to(self.dummy.device)
         return samples, labels
-
-class CFGVectorFieldODE(ODE):
-    def __init__(self, net: ConditionalVectorField, guidance_scale: float = 1.0):
-        self.net = net
-        self.guidance_scale = guidance_scale
-
-    def drift_coefficient(self, x: torch.Tensor, t: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-        - x: (bs, c, h, w)
-        - t: (bs, 1, 1, 1)
-        - y: (bs,)
-        """
-        guided_vector_field = self.net(x, t, y)
-        unguided_y = torch.ones_like(y) * 10
-        unguided_vector_field = self.net(x, t, unguided_y)
-        return (1 - self.guidance_scale) * unguided_vector_field + self.guidance_scale * guided_vector_field
-
 class CFGTrainer(Trainer):
     def __init__(self, path: GaussianConditionalProbabilityPath, model: ConditionalVectorField, eta: float, **kwargs):
         assert eta > 0 and eta < 1
