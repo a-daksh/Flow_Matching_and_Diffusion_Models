@@ -21,7 +21,7 @@ class MNISTSampler(nn.Module, Sampleable):
     """
     def __init__(self):
         super().__init__()
-        self.dataset = datasets.MNIST(
+        self.dataset = datasets.FashionMNIST(
             root='./data',
             train=True,
             download=True,
@@ -227,7 +227,7 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--eta", type=float, default=0.1, help="Label dropout probability for CFG")
     parser.add_argument("--checkpoint_path", type=str, default="checkpoints/checkpoint.pth", help="Path to save/load model checkpoint")
-    parser.add_argument("--checkpoint_every", type=int, default=100, help="Save checkpoint every N epochs")
+    parser.add_argument("--checkpoint_every", type=int, default=1000, help="Save checkpoint every N epochs")
     
     # Model args
     parser.add_argument("--channels", type=int, nargs="+", default=[32, 64, 128], help="U-Net channel sizes")
