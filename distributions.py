@@ -1,11 +1,10 @@
-from typing import List, Tuple
-import torch
-import torch.nn as nn
+import jax
 from base import Sampleable
+from typing import List, Tuple, Optional
 
-class IsotropicGaussian(nn.Module, Sampleable):
+class IsotropicGaussian(Sampleable):
     """
-    Sampleable wrapper around torch.randn
+    Sampleable wrapper around jax.random.normal
     """
     def __init__(self, shape: List[int], std: float = 1.0):
         """
@@ -14,8 +13,7 @@ class IsotropicGaussian(nn.Module, Sampleable):
         super().__init__()
         self.shape = shape
         self.std = std
-        self.dummy = nn.Buffer(torch.zeros(1)) # Will automatically be moved when self.to(...) is called...
 
-    def sample(self, num_samples) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.std * torch.randn(num_samples, *self.shape).to(self.dummy.device), None
+    def sample(self, key, num_samples) -> Tuple[jax.Array, Optional[jax.Array]]:
+        return self.std * jax.random.normal(key,shape=(num_samples, *self.shape)), None
 

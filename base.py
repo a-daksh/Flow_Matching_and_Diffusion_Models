@@ -5,13 +5,14 @@ import torch.nn as nn
 from torch.func import vmap, jacrev
 from tqdm import tqdm
 from utils import model_size_b, MiB
+import jax
 
 class Sampleable(ABC):
     """
     Distribution which can be sampled from
     """
     @abstractmethod
-    def sample(self, num_samples: int) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def sample(self, key: jax.random.PRNGKey, num_samples: int) -> Tuple[jax.Array, Optional[jax.Array]]:
         """
         Args:
             - num_samples: the desired number of samples
