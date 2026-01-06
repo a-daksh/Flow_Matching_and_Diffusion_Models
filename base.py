@@ -95,20 +95,7 @@ class Beta(ABC):
 # Abstract class for both ODE and SDE
 class ODE(ABC):
     @abstractmethod
-    def drift_coefficient(self, xt: torch.Tensor, t: torch.Tensor, **kwargs) -> torch.Tensor:
-        """
-        Returns the drift coefficient of the ODE.
-        Args:
-            - xt: state at time t, shape (bs, c, h, w)
-            - t: time, shape (bs, 1)
-        Returns:
-            - drift_coefficient: shape (bs, c, h, w)
-        """
-        pass
-
-class SDE(ABC):
-    @abstractmethod
-    def drift_coefficient(self, xt: torch.Tensor, t: torch.Tensor, **kwargs) -> torch.Tensor:
+    def drift_coefficient(self, xt: jax.Array, t: jax.Array, **kwargs) -> jax.Array:
         """
         Returns the drift coefficient of the ODE.
         Args:
@@ -119,10 +106,23 @@ class SDE(ABC):
         """
         pass
 
+class SDE(ABC):
     @abstractmethod
-    def diffusion_coefficient(self, xt: torch.Tensor, t: torch.Tensor, **kwargs) -> torch.Tensor:
+    def drift_coefficient(self, xt: jax.Array, t: jax.Array, **kwargs) -> jax.Array:
         """
-        Returns the diffusion coefficient of the ODE.
+        Returns the drift coefficient of the SDE.
+        Args:
+            - xt: state at time t, shape (bs, c, h, w)
+            - t: time, shape (bs, 1, 1, 1)
+        Returns:
+            - drift_coefficient: shape (bs, c, h, w)
+        """
+        pass
+
+    @abstractmethod
+    def diffusion_coefficient(self, xt: jax.Array, t: jax.Array, **kwargs) -> jax.Array:
+        """
+        Returns the diffusion coefficient of the SDE.
         Args:
             - xt: state at time t, shape (bs, c, h, w)
             - t: time, shape (bs, 1, 1, 1)
@@ -134,53 +134,56 @@ class SDE(ABC):
 # Abstract class for simulators
 class Simulator(ABC):
     @abstractmethod
-    def step(self, xt: torch.Tensor, t: torch.Tensor, dt: torch.Tensor, **kwargs):
+    def step(self, xt: jax.Array, t: jax.Array, dt: jax.Array, key: jax.Array, **kwargs) -> jax.Array:
         """
         Takes one simulation step
         Args:
             - xt: state at time t, shape (bs, c, h, w)
             - t: time, shape (bs, 1, 1, 1)
-            - dt: time, shape (bs, 1, 1, 1)
+            - dt: time step, shape (bs, 1, 1, 1)
+            - key: JAX PRNG key (for SDE simulators that need randomness)
         Returns:
             - nxt: state at time t + dt (bs, c, h, w)
         """
         pass
 
-    @torch.no_grad()
-    def simulate(self, x: torch.Tensor, ts: torch.Tensor, **kwargs):
-        """
-        Simulates using the discretization gives by ts
-        Args:
-            - x_init: initial state, shape (bs, c, h, w)
-            - ts: timesteps, shape (bs, nts, 1, 1, 1)
-        Returns:
-            - x_final: final state at time ts[-1], shape (bs, c, h, w)
-        """
-        nts = ts.shape[1]
-        for t_idx in tqdm(range(nts - 1)):
-            t = ts[:, t_idx]
-            h = ts[:, t_idx + 1] - ts[:, t_idx]
-            x = self.step(x, t, h, **kwargs)
-        return x
-
-    @torch.no_grad()
-    def simulate_with_trajectory(self, x: torch.Tensor, ts: torch.Tensor, **kwargs):
+    def simulate(self, x: jax.Array, ts: jax.Array, key: jax.Array, **kwargs) -> jax.Array:
         """
         Simulates using the discretization gives by ts
         Args:
             - x: initial state, shape (bs, c, h, w)
             - ts: timesteps, shape (bs, nts, 1, 1, 1)
+            - key: JAX PRNG key
+        Returns:
+            - x_final: final state at time ts[-1], shape (bs, c, h, w)
+        """
+        nts = ts.shape[1]
+        keys = jax.random.split(key, nts - 1)
+        for t_idx in tqdm(range(nts - 1)):
+            t = ts[:, t_idx]
+            h = ts[:, t_idx + 1] - ts[:, t_idx]
+            x = self.step(x, t, h, keys[t_idx], **kwargs)
+        return x
+
+    def simulate_with_trajectory(self, x: jax.Array, ts: jax.Array, key: jax.Array, **kwargs) -> jax.Array:
+        """
+        Simulates using the discretization gives by ts
+        Args:
+            - x: initial state, shape (bs, c, h, w)
+            - ts: timesteps, shape (bs, nts, 1, 1, 1)
+            - key: JAX PRNG key
         Returns:
             - xs: trajectory of xts over ts, shape (batch_size, nts, c, h, w)
         """
-        xs = [x.clone()]
+        xs = [x]
         nts = ts.shape[1]
+        keys = jax.random.split(key, nts - 1)
         for t_idx in tqdm(range(nts - 1)):
             t = ts[:,t_idx]
             h = ts[:, t_idx + 1] - ts[:, t_idx]
-            x = self.step(x, t, h, **kwargs)
-            xs.append(x.clone())
-        return torch.stack(xs, dim=1)
+            x = self.step(x, t, h, keys[t_idx], **kwargs)
+            xs.append(x)
+        return jnp.stack(xs, axis=1)
 
 # Abstract class for conditional 
 class ConditionalProbabilityPath(ABC):
@@ -260,13 +263,13 @@ class ConditionalProbabilityPath(ABC):
         """
         pass
 
-class ConditionalVectorField(nn.Module, ABC):
+class ConditionalVectorField(ABC):
     """
     MLP-parameterization of the learned vector field u_t^theta(x)
     """
 
     @abstractmethod
-    def forward(self, x: torch.Tensor, t: torch.Tensor, y: torch.Tensor):
+    def __call__(self, x: jax.Array, t: jax.Array, y: jax.Array) -> jax.Array:
         """
         Args:
         - x: (bs, c, h, w)
