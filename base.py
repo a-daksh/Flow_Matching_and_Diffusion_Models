@@ -6,6 +6,7 @@ from torch.func import vmap, jacrev
 from tqdm import tqdm
 from utils import model_size_b, MiB
 import jax
+import jax.numpy as jnp
 
 class Sampleable(ABC):
     """
@@ -26,16 +27,16 @@ class Sampleable(ABC):
 class Alpha(ABC):
     def __init__(self):
         # Check alpha_t(0) = 0
-        assert torch.allclose(
-            self(torch.zeros(1,1,1,1)), torch.zeros(1,1,1,1)
+        assert jnp.allclose(
+            self(jnp.zeros((1,1,1,1))), jnp.zeros((1,1,1,1))
         )
         # Check alpha_1 = 1
-        assert torch.allclose(
-            self(torch.ones(1,1,1,1)), torch.ones(1,1,1,1)
+        assert jnp.allclose(
+            self(jnp.ones((1,1,1,1))), jnp.ones((1,1,1,1))
         )
 
     @abstractmethod
-    def __call__(self, t: torch.Tensor) -> torch.Tensor:
+    def __call__(self, t: jax.Array) -> jax.Array:
         """
         Evaluates alpha_t. Should satisfy: self(0.0) = 0.0, self(1.0) = 1.0.
         Args:
@@ -45,7 +46,7 @@ class Alpha(ABC):
         """
         pass
 
-    def dt(self, t: torch.Tensor) -> torch.Tensor:
+    def dt(self, t: jax.Array) -> jax.Array:
         """
         Evaluates d/dt alpha_t.
         Args:
@@ -53,23 +54,23 @@ class Alpha(ABC):
         Returns:
             - d/dt alpha_t (num_samples, 1, 1, 1)
         """
-        t = t.unsqueeze(1)
-        dt = vmap(jacrev(self))(t)
-        return dt.view(-1, 1, 1, 1)
+        t_flat = t.squeeze()
+        dt = jax.vmap(jax.grad(lambda s: self(s[None, None, None, None]).squeeze()))(t_flat)
+        return dt.reshape(-1, 1, 1, 1)
 
 class Beta(ABC):
     def __init__(self):
         # Check beta_0 = 1
-        assert torch.allclose(
-            self(torch.zeros(1,1,1,1)), torch.ones(1,1,1,1)
+        assert jnp.allclose(
+            self(jnp.zeros((1,1,1,1))), jnp.ones((1,1,1,1))
         )
         # Check beta_1 = 0
-        assert torch.allclose(
-            self(torch.ones(1,1,1,1)), torch.zeros(1,1,1,1)
+        assert jnp.allclose(
+            self(jnp.ones((1,1,1,1))), jnp.zeros((1,1,1,1))
         )
 
     @abstractmethod
-    def __call__(self, t: torch.Tensor) -> torch.Tensor:
+    def __call__(self, t: jax.Array) -> jax.Array:
         """
         Evaluates alpha_t. Should satisfy: self(0.0) = 1.0, self(1.0) = 0.0.
         Args:
@@ -79,7 +80,7 @@ class Beta(ABC):
         """
         pass
 
-    def dt(self, t: torch.Tensor) -> torch.Tensor:
+    def dt(self, t: jax.Array) -> jax.Array:
         """
         Evaluates d/dt beta_t.
         Args:
@@ -87,9 +88,9 @@ class Beta(ABC):
         Returns:
             - d/dt beta_t (num_samples, 1, 1, 1)
         """
-        t = t.unsqueeze(1)
-        dt = vmap(jacrev(self))(t)
-        return dt.view(-1, 1, 1, 1)
+        t_flat = t.squeeze()
+        dt = jax.vmap(jax.grad(lambda s: self(s[None, None, None, None]).squeeze()))(t_flat)
+        return dt.reshape(-1, 1, 1, 1)
 
 # Abstract class for both ODE and SDE
 class ODE(ABC):

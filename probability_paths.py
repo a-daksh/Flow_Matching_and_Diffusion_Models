@@ -1,4 +1,6 @@
 from typing import List
+import jax
+import jax.numpy as jnp
 import torch
 from base import Alpha, Beta, ConditionalProbabilityPath, Sampleable
 from distributions import IsotropicGaussian
@@ -8,7 +10,7 @@ class LinearAlpha(Alpha):
     Implements alpha_t = t
     """
 
-    def __call__(self, t: torch.Tensor) -> torch.Tensor:
+    def __call__(self, t: jax.Array) -> jax.Array:
         """
         Args:
             - t: time (num_samples, 1, 1, 1)
@@ -17,7 +19,7 @@ class LinearAlpha(Alpha):
         """
         return t
 
-    def dt(self, t: torch.Tensor) -> torch.Tensor:
+    def dt(self, t: jax.Array) -> jax.Array:
         """
         Evaluates d/dt alpha_t.
         Args:
@@ -25,13 +27,13 @@ class LinearAlpha(Alpha):
         Returns:
             - d/dt alpha_t (num_samples, 1, 1, 1)
         """
-        return torch.ones_like(t)
+        return jnp.ones_like(t)
 
 class LinearBeta(Beta):
     """
     Implements beta_t = 1-t
     """
-    def __call__(self, t: torch.Tensor) -> torch.Tensor:
+    def __call__(self, t: jax.Array) -> jax.Array:
         """
         Args:
             - t: time (num_samples, 1)
@@ -40,7 +42,7 @@ class LinearBeta(Beta):
         """
         return 1-t
 
-    def dt(self, t: torch.Tensor) -> torch.Tensor:
+    def dt(self, t: jax.Array) -> jax.Array:
         """
         Evaluates d/dt alpha_t.
         Args:
@@ -48,7 +50,7 @@ class LinearBeta(Beta):
         Returns:
             - d/dt alpha_t (num_samples, 1, 1, 1)
         """
-        return - torch.ones_like(t)
+        return - jnp.ones_like(t)
 
 class GaussianConditionalProbabilityPath(ConditionalProbabilityPath):
     def __init__(self, p_data: Sampleable, p_simple_shape: List[int], alpha: Alpha, beta: Beta):
