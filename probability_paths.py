@@ -1,7 +1,7 @@
-from typing import List
+from typing import List, Tuple, Optional
 import jax
 import jax.numpy as jnp
-import torch
+import jax.random as jrandom
 from base import Alpha, Beta, ConditionalProbabilityPath, Sampleable
 from distributions import IsotropicGaussian
 
@@ -59,29 +59,31 @@ class GaussianConditionalProbabilityPath(ConditionalProbabilityPath):
         self.alpha = alpha
         self.beta = beta
 
-    def sample_conditioning_variable(self, num_samples: int) -> torch.Tensor:
+    def sample_conditioning_variable(self, key: jax.Array, num_samples: int) -> Tuple[jax.Array, Optional[jax.Array]]:
         """
         Samples the conditioning variable z and label y
         Args:
+            - key: JAX PRNG key
             - num_samples: the number of samples
         Returns:
             - z: (num_samples, c, h, w)
             - y: (num_samples, label_dim)
         """
-        return self.p_data.sample(num_samples)
+        return self.p_data.sample(key, num_samples)
 
-    def sample_conditional_path(self, z: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    def sample_conditional_path(self, z: jax.Array, t: jax.Array, key: jax.Array) -> jax.Array:
         """
         Samples from the conditional distribution p_t(x|z)
         Args:
             - z: conditioning variable (num_samples, c, h, w)
             - t: time (num_samples, 1, 1, 1)
+            - key: JAX PRNG key
         Returns:
             - x: samples from p_t(x|z), (num_samples, c, h, w)
         """
-        return self.alpha(t) * z + self.beta(t) * torch.randn_like(z)
+        return self.alpha(t) * z + self.beta(t) * jax.random.normal(key, shape=z.shape)
 
-    def conditional_vector_field(self, x: torch.Tensor, z: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    def conditional_vector_field(self, x: jax.Array, z: jax.Array, t: jax.Array) -> jax.Array:
         """
         Evaluates the conditional vector field u_t(x|z)
         Args:
@@ -98,7 +100,7 @@ class GaussianConditionalProbabilityPath(ConditionalProbabilityPath):
 
         return (dt_alpha_t - dt_beta_t / beta_t * alpha_t) * z + dt_beta_t / beta_t * x
 
-    def conditional_score(self, x: torch.Tensor, z: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    def conditional_score(self, x: jax.Array, z: jax.Array, t: jax.Array) -> jax.Array:
         """
         Evaluates the conditional score of p_t(x|z)
         Args:

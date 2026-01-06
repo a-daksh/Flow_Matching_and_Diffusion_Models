@@ -183,35 +183,37 @@ class Simulator(ABC):
         return torch.stack(xs, dim=1)
 
 # Abstract class for conditional 
-class ConditionalProbabilityPath(nn.Module, ABC):
+class ConditionalProbabilityPath(ABC):
     """
     Abstract base class for conditional probability paths
     """
     def __init__(self, p_simple: Sampleable, p_data: Sampleable):
-        super().__init__()
         self.p_simple = p_simple
         self.p_data = p_data
 
-    def sample_marginal_path(self, t: torch.Tensor) -> torch.Tensor:
+    def sample_marginal_path(self, t: jax.Array, key: jax.Array) -> jax.Array:
         """
         Samples from the marginal distribution p_t(x) = p_t(x|z) p(z)
         Args:
             - t: time (num_samples, 1, 1, 1)
+            - key: JAX PRNG key
         Returns:
             - x: samples from p_t(x), (num_samples, c, h, w)
         """
         num_samples = t.shape[0]
+        key1, key2 = jax.random.split(key)
         # Sample conditioning variable z ~ p(z)
-        z, _ = self.sample_conditioning_variable(num_samples) # (num_samples, c, h, w)
+        z, _ = self.sample_conditioning_variable(key1, num_samples) # (num_samples, c, h, w)
         # Sample conditional probability path x ~ p_t(x|z)
-        x = self.sample_conditional_path(z, t) # (num_samples, c, h, w)
+        x = self.sample_conditional_path(z, t, key2) # (num_samples, c, h, w)
         return x
 
     @abstractmethod
-    def sample_conditioning_variable(self, num_samples: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def sample_conditioning_variable(self, key: jax.Array, num_samples: int) -> Tuple[jax.Array, Optional[jax.Array]]:
         """
         Samples the conditioning variable z and label y
         Args:
+            - key: JAX PRNG key
             - num_samples: the number of samples
         Returns:
             - z: (num_samples, c, h, w)
@@ -220,19 +222,20 @@ class ConditionalProbabilityPath(nn.Module, ABC):
         pass
 
     @abstractmethod
-    def sample_conditional_path(self, z: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    def sample_conditional_path(self, z: jax.Array, t: jax.Array, key: jax.Array) -> jax.Array:
         """
         Samples from the conditional distribution p_t(x|z)
         Args:
             - z: conditioning variable (num_samples, c, h, w)
             - t: time (num_samples, 1, 1, 1)
+            - key: JAX PRNG key
         Returns:
             - x: samples from p_t(x|z), (num_samples, c, h, w)
         """
         pass
 
     @abstractmethod
-    def conditional_vector_field(self, x: torch.Tensor, z: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    def conditional_vector_field(self, x: jax.Array, z: jax.Array, t: jax.Array) -> jax.Array:
         """
         Evaluates the conditional vector field u_t(x|z)
         Args:
@@ -245,7 +248,7 @@ class ConditionalProbabilityPath(nn.Module, ABC):
         pass
 
     @abstractmethod
-    def conditional_score(self, x: torch.Tensor, z: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    def conditional_score(self, x: jax.Array, z: jax.Array, t: jax.Array) -> jax.Array:
         """
         Evaluates the conditional score of p_t(x|z)
         Args:
