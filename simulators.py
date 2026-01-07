@@ -1,7 +1,6 @@
 import jax
 import jax.numpy as jnp
-from base import Simulator, ODE, SDE
-from models import ConditionalVectorField
+from base import Simulator, ODE, SDE, ConditionalVectorField
 
 class EulerSimulator(Simulator):
     def __init__(self, ode: ODE):
