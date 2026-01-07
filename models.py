@@ -1,214 +1,463 @@
-from typing import List
 import math
-import torch
-import torch.nn as nn
-from base import ConditionalVectorField
+from collections.abc import Callable
 
-class FourierEncoder(nn.Module):
-    """
-    Based on https://github.com/lucidrains/denoising-diffusion-pytorch/blob/main/denoising_diffusion_pytorch/karras_unet.py#L183
-    """
-    def __init__(self, dim: int):
-        super().__init__()
-        assert dim % 2 == 0
-        self.half_dim = dim // 2
-        self.weights = nn.Parameter(torch.randn(1, self.half_dim))
+import equinox as eqx
+import jax
+import jax.numpy as jnp
+import jax.random as jr
+from einops import rearrange
 
-    def forward(self, t: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-        - t: (bs, 1, 1, 1)
-        Returns:
-        - embeddings: (bs, dim)
-        """
-        t = t.view(-1, 1) # (bs, 1)
-        freqs = t * self.weights * 2 * math.pi # (bs, half_dim)
-        sin_embed = torch.sin(freqs) # (bs, half_dim)
-        cos_embed = torch.cos(freqs) # (bs, half_dim)
-        return torch.cat([sin_embed, cos_embed], dim=-1) * math.sqrt(2) # (bs, dim)
 
-class ResidualLayer(nn.Module):
-    def __init__(self, channels: int, time_embed_dim: int, y_embed_dim: int):
-        super().__init__()
-        self.block1 = nn.Sequential(
-            nn.SiLU(),
-            nn.BatchNorm2d(channels),
-            nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+class SinusoidalPosEmb(eqx.Module):
+    emb: jax.Array
+
+    def __init__(self, dim):
+        half_dim = dim // 2
+        emb = math.log(10000) / (half_dim - 1)
+        self.emb = jnp.exp(jnp.arange(half_dim) * -emb)
+
+    def __call__(self, x):
+        emb = x * self.emb
+        emb = jnp.concatenate((jnp.sin(emb), jnp.cos(emb)), axis=-1)
+        return emb
+
+
+class LinearTimeSelfAttention(eqx.Module):
+    group_norm: eqx.nn.GroupNorm
+    heads: int
+    to_qkv: eqx.nn.Conv2d
+    to_out: eqx.nn.Conv2d
+
+    def __init__(
+        self,
+        dim,
+        key,
+        heads=4,
+        dim_head=32,
+    ):
+        keys = jax.random.split(key, 2)
+        self.group_norm = eqx.nn.GroupNorm(min(dim // 4, 32), dim)
+        self.heads = heads
+        hidden_dim = dim_head * heads
+        self.to_qkv = eqx.nn.Conv2d(dim, hidden_dim * 3, 1, key=keys[0])
+        self.to_out = eqx.nn.Conv2d(hidden_dim, dim, 1, key=keys[1])
+
+    def __call__(self, x):
+        c, h, w = x.shape
+        x = self.group_norm(x)
+        qkv = self.to_qkv(x)
+        q, k, v = rearrange(
+            qkv, "(qkv heads c) h w -> qkv heads c (h w)", heads=self.heads, qkv=3
         )
-        self.block2 = nn.Sequential(
-            nn.SiLU(),
-            nn.BatchNorm2d(channels),
-            nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        k = jax.nn.softmax(k, axis=-1)
+        context = jnp.einsum("hdn,hen->hde", k, v)
+        out = jnp.einsum("hde,hdn->hen", context, q)
+        out = rearrange(
+            out, "heads c (h w) -> (heads c) h w", heads=self.heads, h=h, w=w
         )
-        # Converts (bs, time_embed_dim) -> (bs, channels)
-        self.time_adapter = nn.Sequential(
-            nn.Linear(time_embed_dim, time_embed_dim),
-            nn.SiLU(),
-            nn.Linear(time_embed_dim, channels)
+        return self.to_out(out)
+
+
+def upsample_2d(y, factor=2):
+    C, H, W = y.shape
+    y = jnp.reshape(y, [C, H, 1, W, 1])
+    y = jnp.tile(y, [1, 1, factor, 1, factor])
+    return jnp.reshape(y, [C, H * factor, W * factor])
+
+
+def downsample_2d(y, factor=2):
+    C, H, W = y.shape
+    y = jnp.reshape(y, [C, H // factor, factor, W // factor, factor])
+    return jnp.mean(y, axis=[2, 4])
+
+
+def exact_zip(*args):
+    _len = len(args[0])
+    for arg in args:
+        assert len(arg) == _len
+    return zip(*args)
+
+
+def key_split_allowing_none(key):
+    if key is None:
+        return key, None
+    else:
+        return jr.split(key)
+
+
+class Residual(eqx.Module):
+    fn: LinearTimeSelfAttention
+
+    def __init__(self, fn):
+        self.fn = fn
+
+    def __call__(self, x, *args, **kwargs):
+        return self.fn(x, *args, **kwargs) + x
+
+
+class ResnetBlock(eqx.Module):
+    dim_out: int
+    is_biggan: bool
+    up: bool
+    down: bool
+    dropout_rate: float
+    time_emb_dim: int
+    mlp_layers: list[Callable | eqx.nn.Linear]
+    scaling: None | Callable | eqx.nn.ConvTranspose2d | eqx.nn.Conv2d
+    block1_groupnorm: eqx.nn.GroupNorm
+    block1_conv: eqx.nn.Conv2d
+    block2_layers: list[eqx.nn.GroupNorm | eqx.nn.Dropout | eqx.nn.Conv2d | Callable]
+    res_conv: eqx.nn.Conv2d
+    attn: Residual | None
+
+    def __init__(
+        self,
+        dim_in,
+        dim_out,
+        is_biggan,
+        up,
+        down,
+        time_emb_dim,
+        dropout_rate,
+        is_attn,
+        heads,
+        dim_head,
+        *,
+        key,
+    ):
+        keys = jax.random.split(key, 7)
+        self.dim_out = dim_out
+        self.is_biggan = is_biggan
+        self.up = up
+        self.down = down
+        self.dropout_rate = dropout_rate
+        self.time_emb_dim = time_emb_dim
+
+        self.mlp_layers = [
+            jax.nn.silu,
+            eqx.nn.Linear(time_emb_dim, dim_out, key=keys[0]),
+        ]
+        self.block1_groupnorm = eqx.nn.GroupNorm(min(dim_in // 4, 32), dim_in)
+        self.block1_conv = eqx.nn.Conv2d(dim_in, dim_out, 3, padding=1, key=keys[1])
+        self.block2_layers = [
+            eqx.nn.GroupNorm(min(dim_out // 4, 32), dim_out),
+            jax.nn.silu,
+            eqx.nn.Dropout(dropout_rate),
+            eqx.nn.Conv2d(dim_out, dim_out, 3, padding=1, key=keys[2]),
+        ]
+
+        assert not self.up or not self.down
+
+        if is_biggan:
+            if self.up:
+                self.scaling = upsample_2d
+            elif self.down:
+                self.scaling = downsample_2d
+            else:
+                self.scaling = None
+        else:
+            if self.up:
+                self.scaling = eqx.nn.ConvTranspose2d(
+                    dim_in,
+                    dim_in,
+                    kernel_size=4,
+                    stride=2,
+                    padding=1,
+                    key=keys[3],
+                )
+            elif self.down:
+                self.scaling = eqx.nn.Conv2d(
+                    dim_in,
+                    dim_in,
+                    kernel_size=3,
+                    stride=2,
+                    padding=1,
+                    key=keys[4],
+                )
+            else:
+                self.scaling = None
+        # For DDPM Yang use their own custom layer called NIN, which is
+        # equivalent to a 1x1 conv
+        self.res_conv = eqx.nn.Conv2d(dim_in, dim_out, kernel_size=1, key=keys[5])
+
+        if is_attn:
+            self.attn = Residual(
+                LinearTimeSelfAttention(
+                    dim_out,
+                    heads=heads,
+                    dim_head=dim_head,
+                    key=keys[6],
+                )
+            )
+        else:
+            self.attn = None
+
+    def __call__(self, x, t, *, key):
+        C, _, _ = x.shape
+        # In DDPM, each set of resblocks ends with an up/down sampling. In
+        # biggan there is a final resblock after the up/downsampling. In this
+        # code, the biggan approach is taken for both.
+        # norm -> nonlinearity -> up/downsample -> conv follows Yang
+        # https://github.dev/yang-song/score_sde/blob/main/models/layerspp.py
+        h = jax.nn.silu(self.block1_groupnorm(x))
+        if self.up or self.down:
+            h = self.scaling(h)  # pyright: ignore
+            x = self.scaling(x)  # pyright: ignore
+        h = self.block1_conv(h)
+
+        for layer in self.mlp_layers:
+            t = layer(t)
+        h = h + t[..., None, None]
+        for layer in self.block2_layers:
+            # Precisely 1 dropout layer in block2_layers which requires a key.
+            if isinstance(layer, eqx.nn.Dropout):
+                h = layer(h, key=key)
+            else:
+                h = layer(h)
+
+        if C != self.dim_out or self.up or self.down:
+            x = self.res_conv(x)
+
+        out = (h + x) / jnp.sqrt(2)
+        if self.attn is not None:
+            out = self.attn(out)
+        return out
+
+
+class UNet(eqx.Module):
+    time_pos_emb: SinusoidalPosEmb
+    mlp: eqx.nn.MLP
+    first_conv: eqx.nn.Conv2d
+    down_res_blocks: list[list[ResnetBlock]]
+    mid_block1: ResnetBlock
+    mid_block2: ResnetBlock
+    ups_res_blocks: list[list[ResnetBlock]]
+    final_conv_layers: list[Callable | eqx.nn.LayerNorm | eqx.nn.Conv2d]
+
+    def __init__(
+        self,
+        data_shape: tuple[int, int, int],
+        is_biggan: bool,
+        dim_mults: list[int],
+        hidden_size: int,
+        heads: int,
+        dim_head: int,
+        dropout_rate: float,
+        num_res_blocks: int,
+        attn_resolutions: list[int],
+        *,
+        key,
+    ):
+        keys = jax.random.split(key, 7)
+        del key
+
+        data_channels, in_height, in_width = data_shape
+
+        dims = [hidden_size] + [hidden_size * m for m in dim_mults]
+        in_out = list(exact_zip(dims[:-1], dims[1:]))
+
+        self.time_pos_emb = SinusoidalPosEmb(hidden_size)
+        self.mlp = eqx.nn.MLP(
+            hidden_size,
+            hidden_size,
+            4 * hidden_size,
+            1,
+            activation=jax.nn.silu,
+            key=keys[0],
         )
-        # Converts (bs, y_embed_dim) -> (bs, channels)
-        self.y_adapter = nn.Sequential(
-            nn.Linear(y_embed_dim, y_embed_dim),
-            nn.SiLU(),
-            nn.Linear(y_embed_dim, channels)
+        self.first_conv = eqx.nn.Conv2d(
+            data_channels, hidden_size, kernel_size=3, padding=1, key=keys[1]
         )
 
-    def forward(self, x: torch.Tensor, t_embed: torch.Tensor, y_embed: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-        - x: (bs, c, h, w)
-        - t_embed: (bs, t_embed_dim)
-        - y_embed: (bs, y_embed_dim)
-        """
-        res = x.clone() # (bs, c, h, w)
+        h, w = in_height, in_width
+        self.down_res_blocks = []
+        num_keys = len(in_out) * num_res_blocks - 1
+        keys_resblock = jr.split(keys[2], num_keys)
+        i = 0
+        for ind, (dim_in, dim_out) in enumerate(in_out):
+            if h in attn_resolutions and w in attn_resolutions:
+                is_attn = True
+            else:
+                is_attn = False
+            res_blocks = [
+                ResnetBlock(
+                    dim_in=dim_in,
+                    dim_out=dim_out,
+                    is_biggan=is_biggan,
+                    up=False,
+                    down=False,
+                    time_emb_dim=hidden_size,
+                    dropout_rate=dropout_rate,
+                    is_attn=is_attn,
+                    heads=heads,
+                    dim_head=dim_head,
+                    key=keys_resblock[i],
+                )
+            ]
+            i += 1
+            for _ in range(num_res_blocks - 2):
+                res_blocks.append(
+                    ResnetBlock(
+                        dim_in=dim_out,
+                        dim_out=dim_out,
+                        is_biggan=is_biggan,
+                        up=False,
+                        down=False,
+                        time_emb_dim=hidden_size,
+                        dropout_rate=dropout_rate,
+                        is_attn=is_attn,
+                        heads=heads,
+                        dim_head=dim_head,
+                        key=keys_resblock[i],
+                    )
+                )
+                i += 1
+            if ind < (len(in_out) - 1):
+                res_blocks.append(
+                    ResnetBlock(
+                        dim_in=dim_out,
+                        dim_out=dim_out,
+                        is_biggan=is_biggan,
+                        up=False,
+                        down=True,
+                        time_emb_dim=hidden_size,
+                        dropout_rate=dropout_rate,
+                        is_attn=is_attn,
+                        heads=heads,
+                        dim_head=dim_head,
+                        key=keys_resblock[i],
+                    )
+                )
+                i += 1
+                h, w = h // 2, w // 2
+            self.down_res_blocks.append(res_blocks)
+        assert i == num_keys
 
-        # Initial conv block
-        x = self.block1(x) # (bs, c, h, w)
+        mid_dim = dims[-1]
+        self.mid_block1 = ResnetBlock(
+            dim_in=mid_dim,
+            dim_out=mid_dim,
+            is_biggan=is_biggan,
+            up=False,
+            down=False,
+            time_emb_dim=hidden_size,
+            dropout_rate=dropout_rate,
+            is_attn=True,
+            heads=heads,
+            dim_head=dim_head,
+            key=keys[3],
+        )
+        self.mid_block2 = ResnetBlock(
+            dim_in=mid_dim,
+            dim_out=mid_dim,
+            is_biggan=is_biggan,
+            up=False,
+            down=False,
+            time_emb_dim=hidden_size,
+            dropout_rate=dropout_rate,
+            is_attn=False,
+            heads=heads,
+            dim_head=dim_head,
+            key=keys[4],
+        )
 
-        # Add time embedding
-        t_embed = self.time_adapter(t_embed).unsqueeze(-1).unsqueeze(-1) # (bs, c, 1, 1)
-        x = x + t_embed
+        self.ups_res_blocks = []
+        num_keys = len(in_out) * (num_res_blocks + 1) - 1
+        keys_resblock = jr.split(keys[5], num_keys)
+        i = 0
+        for ind, (dim_in, dim_out) in enumerate(reversed(in_out)):
+            if h in attn_resolutions and w in attn_resolutions:
+                is_attn = True
+            else:
+                is_attn = False
+            res_blocks = []
+            for _ in range(num_res_blocks - 1):
+                res_blocks.append(
+                    ResnetBlock(
+                        dim_in=dim_out * 2,
+                        dim_out=dim_out,
+                        is_biggan=is_biggan,
+                        up=False,
+                        down=False,
+                        time_emb_dim=hidden_size,
+                        dropout_rate=dropout_rate,
+                        is_attn=is_attn,
+                        heads=heads,
+                        dim_head=dim_head,
+                        key=keys_resblock[i],
+                    )
+                )
+                i += 1
+            res_blocks.append(
+                ResnetBlock(
+                    dim_in=dim_out + dim_in,
+                    dim_out=dim_in,
+                    is_biggan=is_biggan,
+                    up=False,
+                    down=False,
+                    time_emb_dim=hidden_size,
+                    dropout_rate=dropout_rate,
+                    is_attn=is_attn,
+                    heads=heads,
+                    dim_head=dim_head,
+                    key=keys_resblock[i],
+                )
+            )
+            i += 1
+            if ind < (len(in_out) - 1):
+                res_blocks.append(
+                    ResnetBlock(
+                        dim_in=dim_in,
+                        dim_out=dim_in,
+                        is_biggan=is_biggan,
+                        up=True,
+                        down=False,
+                        time_emb_dim=hidden_size,
+                        dropout_rate=dropout_rate,
+                        is_attn=is_attn,
+                        heads=heads,
+                        dim_head=dim_head,
+                        key=keys_resblock[i],
+                    )
+                )
+                i += 1
+                h, w = h * 2, w * 2
 
-        # Add y embedding (conditional embedding)
-        y_embed = self.y_adapter(y_embed).unsqueeze(-1).unsqueeze(-1) # (bs, c, 1, 1)
-        x = x + y_embed
+            self.ups_res_blocks.append(res_blocks)
+        assert i == num_keys
 
-        # Second conv block
-        x = self.block2(x) # (bs, c, h, w)
+        self.final_conv_layers = [
+            eqx.nn.GroupNorm(min(hidden_size // 4, 32), hidden_size),
+            jax.nn.silu,
+            eqx.nn.Conv2d(hidden_size, data_channels, 1, key=keys[6]),
+        ]
 
-        # Add back residual
-        x = x + res # (bs, c, h, w)
+    def __call__(self, t, y, *, key=None):
+        t = self.time_pos_emb(t)
+        t = self.mlp(t)
+        h = self.first_conv(y)
+        hs = [h]
+        for res_blocks in self.down_res_blocks:
+            for res_block in res_blocks:
+                key, subkey = key_split_allowing_none(key)
+                h = res_block(h, t, key=subkey)
+                hs.append(h)
 
-        return x
+        key, subkey = key_split_allowing_none(key)
+        h = self.mid_block1(h, t, key=subkey)
+        key, subkey = key_split_allowing_none(key)
+        h = self.mid_block2(h, t, key=subkey)
 
-class Encoder(nn.Module):
-    def __init__(self, channels_in: int, channels_out: int, num_residual_layers: int, t_embed_dim: int, y_embed_dim: int):
-        super().__init__()
-        self.res_blocks = nn.ModuleList([
-            ResidualLayer(channels_in, t_embed_dim, y_embed_dim) for _ in range(num_residual_layers)
-        ])
-        self.downsample = nn.Conv2d(channels_in, channels_out, kernel_size=3, stride=2, padding=1)
+        for res_blocks in self.ups_res_blocks:
+            for res_block in res_blocks:
+                key, subkey = key_split_allowing_none(key)
+                if res_block.up:
+                    h = res_block(h, t, key=subkey)
+                else:
+                    h = res_block(jnp.concatenate((h, hs.pop()), axis=0), t, key=subkey)
 
-    def forward(self, x: torch.Tensor, t_embed: torch.Tensor, y_embed: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-        - x: (bs, c_in, h, w)
-        - t_embed: (bs, t_embed_dim)
-        - y_embed: (bs, y_embed_dim)
-        """
-        # Pass through residual blocks: (bs, c_in, h, w) -> (bs, c_in, h, w)
-        for block in self.res_blocks:
-            x = block(x, t_embed, y_embed)
+        assert len(hs) == 0
 
-        # Downsample: (bs, c_in, h, w) -> (bs, c_out, h // 2, w // 2)
-        x = self.downsample(x)
-
-        return x
-
-class Midcoder(nn.Module):
-    def __init__(self, channels: int, num_residual_layers: int, t_embed_dim: int, y_embed_dim: int):
-        super().__init__()
-        self.res_blocks = nn.ModuleList([
-            ResidualLayer(channels, t_embed_dim, y_embed_dim) for _ in range(num_residual_layers)
-        ])
-
-    def forward(self, x: torch.Tensor, t_embed: torch.Tensor, y_embed: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-        - x: (bs, c, h, w)
-        - t_embed: (bs, t_embed_dim)
-        - y_embed: (bs, y_embed_dim)
-        """
-        # Pass through residual blocks: (bs, c, h, w) -> (bs, c, h, w)
-        for block in self.res_blocks:
-            x = block(x, t_embed, y_embed)
-
-        return x
-
-class Decoder(nn.Module):
-    def __init__(self, channels_in: int, channels_out: int, num_residual_layers: int, t_embed_dim: int, y_embed_dim: int):
-        super().__init__()
-        self.upsample = nn.Sequential(nn.Upsample(scale_factor=2, mode='bilinear'), nn.Conv2d(channels_in, channels_out, kernel_size=3, padding=1))
-        self.res_blocks = nn.ModuleList([
-            ResidualLayer(channels_out, t_embed_dim, y_embed_dim) for _ in range(num_residual_layers)
-        ])
-
-    def forward(self, x: torch.Tensor, t_embed: torch.Tensor, y_embed: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-        - x: (bs, c, h, w)
-        - t_embed: (bs, t_embed_dim)
-        - y_embed: (bs, y_embed_dim)
-        """
-        # Upsample: (bs, c_in, h, w) -> (bs, c_out, 2 * h, 2 * w)
-        x = self.upsample(x)
-
-        # Pass through residual blocks: (bs, c_out, h, w) -> (bs, c_out, 2 * h, 2 * w)
-        for block in self.res_blocks:
-            x = block(x, t_embed, y_embed)
-
-        return x
-
-class MNISTUNet(ConditionalVectorField):
-    def __init__(self, channels: List[int], num_residual_layers: int, t_embed_dim: int, y_embed_dim: int):
-        super().__init__()
-        # Initial convolution: (bs, 1, 32, 32) -> (bs, c_0, 32, 32)
-        self.init_conv = nn.Sequential(nn.Conv2d(1, channels[0], kernel_size=3, padding=1), nn.BatchNorm2d(channels[0]), nn.SiLU())
-
-        # Initialize time embedder
-        self.time_embedder = FourierEncoder(t_embed_dim)
-
-        # Initialize y embedder
-        self.y_embedder = nn.Embedding(num_embeddings = 11, embedding_dim = y_embed_dim)
-
-        # Encoders, Midcoders, and Decoders
-        encoders = []
-        decoders = []
-        for (curr_c, next_c) in zip(channels[:-1], channels[1:]):
-            encoders.append(Encoder(curr_c, next_c, num_residual_layers, t_embed_dim, y_embed_dim))
-            decoders.append(Decoder(next_c, curr_c, num_residual_layers, t_embed_dim, y_embed_dim))
-        self.encoders = nn.ModuleList(encoders)
-        self.decoders = nn.ModuleList(reversed(decoders))
-
-        self.midcoder = Midcoder(channels[-1], num_residual_layers, t_embed_dim, y_embed_dim)
-
-        # Final convolution
-        self.final_conv = nn.Conv2d(channels[0], 1, kernel_size=3, padding=1)
-
-    def forward(self, x: torch.Tensor, t: torch.Tensor, y: torch.Tensor):
-        """
-        Args:
-        - x: (bs, 1, 32, 32)
-        - t: (bs, 1, 1, 1)
-        - y: (bs,)
-        Returns:
-        - u_t^theta(x|y): (bs, 1, 32, 32)
-        """
-        # Embed t and y
-        t_embed = self.time_embedder(t) # (bs, time_embed_dim)
-        y_embed = self.y_embedder(y) # (bs, y_embed_dim)
-
-        # Initial convolution
-        x = self.init_conv(x) # (bs, c_0, 32, 32)
-
-        residuals = []
-
-        # Encoders
-        for encoder in self.encoders:
-            x = encoder(x, t_embed, y_embed) # (bs, c_i, h, w) -> (bs, c_{i+1}, h // 2, w //2)
-            residuals.append(x.clone())
-
-        # Midcoder
-        x = self.midcoder(x, t_embed, y_embed)
-
-        # Decoders
-        for decoder in self.decoders:
-            res = residuals.pop() # (bs, c_i, h, w)
-            x = x + res
-            x = decoder(x, t_embed, y_embed) # (bs, c_i, h, w) -> (bs, c_{i-1}, 2 * h, 2 * w)
-
-        # Final convolution
-        x = self.final_conv(x) # (bs, 1, 32, 32)
-
-        return x
-
+        for layer in self.final_conv_layers:
+            h = layer(h)
+        return h
