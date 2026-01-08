@@ -103,6 +103,7 @@ class ResnetBlock(eqx.Module):
     dropout_rate: float
     time_emb_dim: int
     mlp_layers: list[Callable | eqx.nn.Linear]
+    y_mlp_layers: list[Callable | eqx.nn.Linear]
     scaling: None | Callable | eqx.nn.ConvTranspose2d | eqx.nn.Conv2d
     block1_groupnorm: eqx.nn.GroupNorm
     block1_conv: eqx.nn.Conv2d
@@ -118,6 +119,7 @@ class ResnetBlock(eqx.Module):
         up,
         down,
         time_emb_dim,
+        y_emb_dim,
         dropout_rate,
         is_attn,
         heads,
@@ -125,7 +127,7 @@ class ResnetBlock(eqx.Module):
         *,
         key,
     ):
-        keys = jax.random.split(key, 7)
+        keys = jax.random.split(key, 8)
         self.dim_out = dim_out
         self.is_biggan = is_biggan
         self.up = up
@@ -136,6 +138,10 @@ class ResnetBlock(eqx.Module):
         self.mlp_layers = [
             jax.nn.silu,
             eqx.nn.Linear(time_emb_dim, dim_out, key=keys[0]),
+        ]
+        self.y_mlp_layers = [
+            jax.nn.silu,
+            eqx.nn.Linear(y_emb_dim, dim_out, key=keys[7]),
         ]
         self.block1_groupnorm = eqx.nn.GroupNorm(min(dim_in // 4, 32), dim_in)
         self.block1_conv = eqx.nn.Conv2d(dim_in, dim_out, 3, padding=1, key=keys[1])
@@ -192,7 +198,7 @@ class ResnetBlock(eqx.Module):
         else:
             self.attn = None
 
-    def __call__(self, x, t, *, key):
+    def __call__(self, x, t, y, *, key):
         C, _, _ = x.shape
         # In DDPM, each set of resblocks ends with an up/down sampling. In
         # biggan there is a final resblock after the up/downsampling. In this
@@ -205,9 +211,16 @@ class ResnetBlock(eqx.Module):
             x = self.scaling(x)  # pyright: ignore
         h = self.block1_conv(h)
 
+        # Process time embedding
         for layer in self.mlp_layers:
             t = layer(t)
         h = h + t[..., None, None]
+        
+        # Process label embedding
+        for layer in self.y_mlp_layers:
+            y = layer(y)
+        h = h + y[..., None, None]
+        
         for layer in self.block2_layers:
             # Precisely 1 dropout layer in block2_layers which requires a key.
             if isinstance(layer, eqx.nn.Dropout):
@@ -227,12 +240,13 @@ class ResnetBlock(eqx.Module):
 class UNet(eqx.Module):
     time_pos_emb: SinusoidalPosEmb
     mlp: eqx.nn.MLP
+    y_embedder: eqx.nn.Embedding
     first_conv: eqx.nn.Conv2d
     down_res_blocks: list[list[ResnetBlock]]
     mid_block1: ResnetBlock
     mid_block2: ResnetBlock
     ups_res_blocks: list[list[ResnetBlock]]
-    final_conv_layers: list[Callable | eqx.nn.LayerNorm | eqx.nn.Conv2d]
+    final_conv_layers: list[Callable | eqx.nn.GroupNorm | eqx.nn.Conv2d]
 
     def __init__(
         self,
@@ -240,6 +254,7 @@ class UNet(eqx.Module):
         is_biggan: bool,
         dim_mults: list[int],
         hidden_size: int,
+        y_emb_dim: int,
         heads: int,
         dim_head: int,
         dropout_rate: float,
@@ -248,7 +263,7 @@ class UNet(eqx.Module):
         *,
         key,
     ):
-        keys = jax.random.split(key, 7)
+        keys = jax.random.split(key, 8)
         del key
 
         data_channels, in_height, in_width = data_shape
@@ -265,6 +280,7 @@ class UNet(eqx.Module):
             activation=jax.nn.silu,
             key=keys[0],
         )
+        self.y_embedder = eqx.nn.Embedding(num_embeddings=11, embedding_size=y_emb_dim, key=keys[7])
         self.first_conv = eqx.nn.Conv2d(
             data_channels, hidden_size, kernel_size=3, padding=1, key=keys[1]
         )
@@ -287,6 +303,7 @@ class UNet(eqx.Module):
                     up=False,
                     down=False,
                     time_emb_dim=hidden_size,
+                    y_emb_dim=y_emb_dim,
                     dropout_rate=dropout_rate,
                     is_attn=is_attn,
                     heads=heads,
@@ -304,6 +321,7 @@ class UNet(eqx.Module):
                         up=False,
                         down=False,
                         time_emb_dim=hidden_size,
+                        y_emb_dim=y_emb_dim,
                         dropout_rate=dropout_rate,
                         is_attn=is_attn,
                         heads=heads,
@@ -321,6 +339,7 @@ class UNet(eqx.Module):
                         up=False,
                         down=True,
                         time_emb_dim=hidden_size,
+                        y_emb_dim=y_emb_dim,
                         dropout_rate=dropout_rate,
                         is_attn=is_attn,
                         heads=heads,
@@ -341,6 +360,7 @@ class UNet(eqx.Module):
             up=False,
             down=False,
             time_emb_dim=hidden_size,
+            y_emb_dim=y_emb_dim,
             dropout_rate=dropout_rate,
             is_attn=True,
             heads=heads,
@@ -354,6 +374,7 @@ class UNet(eqx.Module):
             up=False,
             down=False,
             time_emb_dim=hidden_size,
+            y_emb_dim=y_emb_dim,
             dropout_rate=dropout_rate,
             is_attn=False,
             heads=heads,
@@ -380,6 +401,7 @@ class UNet(eqx.Module):
                         up=False,
                         down=False,
                         time_emb_dim=hidden_size,
+                        y_emb_dim=y_emb_dim,
                         dropout_rate=dropout_rate,
                         is_attn=is_attn,
                         heads=heads,
@@ -396,6 +418,7 @@ class UNet(eqx.Module):
                     up=False,
                     down=False,
                     time_emb_dim=hidden_size,
+                    y_emb_dim=y_emb_dim,
                     dropout_rate=dropout_rate,
                     is_attn=is_attn,
                     heads=heads,
@@ -413,6 +436,7 @@ class UNet(eqx.Module):
                         up=True,
                         down=False,
                         time_emb_dim=hidden_size,
+                        y_emb_dim=y_emb_dim,
                         dropout_rate=dropout_rate,
                         is_attn=is_attn,
                         heads=heads,
@@ -432,29 +456,30 @@ class UNet(eqx.Module):
             eqx.nn.Conv2d(hidden_size, data_channels, 1, key=keys[6]),
         ]
 
-    def __call__(self, t, y, *, key=None):
+    def __call__(self, t, y_image, y_label, *, key=None):
         t = self.time_pos_emb(t)
         t = self.mlp(t)
-        h = self.first_conv(y)
+        y_emb = self.y_embedder(y_label)  # Embed label
+        h = self.first_conv(y_image)
         hs = [h]
         for res_blocks in self.down_res_blocks:
             for res_block in res_blocks:
                 key, subkey = key_split_allowing_none(key)
-                h = res_block(h, t, key=subkey)
+                h = res_block(h, t, y_emb, key=subkey)
                 hs.append(h)
 
         key, subkey = key_split_allowing_none(key)
-        h = self.mid_block1(h, t, key=subkey)
+        h = self.mid_block1(h, t, y_emb, key=subkey)
         key, subkey = key_split_allowing_none(key)
-        h = self.mid_block2(h, t, key=subkey)
+        h = self.mid_block2(h, t, y_emb, key=subkey)
 
         for res_blocks in self.ups_res_blocks:
             for res_block in res_blocks:
                 key, subkey = key_split_allowing_none(key)
                 if res_block.up:
-                    h = res_block(h, t, key=subkey)
+                    h = res_block(h, t, y_emb, key=subkey)
                 else:
-                    h = res_block(jnp.concatenate((h, hs.pop()), axis=0), t, key=subkey)
+                    h = res_block(jnp.concatenate((h, hs.pop()), axis=0), t, y_emb, key=subkey)
 
         assert len(hs) == 0
 
