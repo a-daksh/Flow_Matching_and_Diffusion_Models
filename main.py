@@ -63,9 +63,9 @@ class CFGTrainer(Trainer):
         self.eta = eta
         self.path = path
 
-    def get_train_loss(self, model: eqx.Module, key: jax.random.PRNGKey, batch_size: int) -> jax.Array:
+    def sample_batch(self, key: jax.random.PRNGKey, batch_size: int):
         # Step 1: Sample z,y from p_data
-        key1, key2, key3, key4, key5 = jax.random.split(key, 5)
+        key1, key2, key3, key4 = jax.random.split(key, 4)
         z, y = self.path.p_data.sample(key1, batch_size)
 
         # Step 2: Set each label to 10 (i.e., null) with probability eta
@@ -75,18 +75,19 @@ class CFGTrainer(Trainer):
         # Step 3: Sample t and x
         t = jax.random.uniform(key3, shape=(batch_size, 1, 1, 1))
         x = self.path.sample_conditional_path(z, t, key4)
+        
+        return x, z, t, y
 
+    def get_train_loss(self, model: eqx.Module, x: jax.Array, z: jax.Array, t: jax.Array, y: jax.Array, key: jax.random.PRNGKey) -> jax.Array:
+        batch_size = x.shape[0]
         # UNet expects: (t_scalar, y_image, y_label, key) where y_image is (C, H, W), y_label is scalar
-        # Our interface: (x_image, t, y_label) where x is (C, H, W), t is (1,1,1), y is label scalar
         def single_sample_model(x_i, t_i, y_i, key_i):
             t_scalar = t_i[0, 0, 0]  # Extract scalar from (1,1,1) shape
-            # x_i is (C, H, W) - this becomes y_image in UNet
-            # y_i is label scalar (int) - pass directly to UNet
             return model(t_scalar, x_i, y_i, key=key_i)
         
         vmapped_model = jax.vmap(single_sample_model, in_axes=(0, 0, 0, 0))
         
-        model_keys = jax.random.split(key5, batch_size)        
+        model_keys = jax.random.split(key, batch_size)        
         pred = vmapped_model(x, t, y, model_keys)  # (batch_size, C, H, W)
         target = self.path.conditional_vector_field(x, z, t)
         loss = jnp.mean((pred - target) ** 2)

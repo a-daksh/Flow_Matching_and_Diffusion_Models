@@ -286,8 +286,13 @@ class Trainer(ABC):
         self.model = model
 
     @abstractmethod
-    def get_train_loss(self, model: eqx.Module, **kwargs) -> jax.Array:
-        """Compute loss given a model. Must be a pure function."""
+    def sample_batch(self, key: jax.random.PRNGKey, batch_size: int):
+        """Sample a batch of training data. Called outside JIT."""
+        pass
+
+    @abstractmethod
+    def get_train_loss(self, model: eqx.Module, *args, **kwargs) -> jax.Array:
+        """Compute loss given a model and pre-sampled data. Must be a pure function."""
         pass
 
     def get_optimizer(self, lr: float):
@@ -303,22 +308,25 @@ class Trainer(ABC):
         opt_state = opt.init(eqx.filter(self.model, eqx.is_array))
 
         @eqx.filter_jit
-        def make_step(model, opt_state, **loss_kwargs):
-            loss, grads = eqx.filter_value_and_grad(self.get_train_loss)(model, **loss_kwargs)
+        def train_step(model, opt_state, *args):
+            loss, grads = eqx.filter_value_and_grad(self.get_train_loss)(model, *args)
             updates, opt_state = opt.update(grads, opt_state)
             model = eqx.apply_updates(model, updates)
             return model, opt_state, loss
 
         key = kwargs.pop('key', jax.random.PRNGKey(0))
+        batch_size = kwargs.pop('batch_size', 32)
         
         # Train loop
         pbar = tqdm(range(num_epochs))
         for epoch in pbar:
-            # Generate new key for each epoch
-            key, subkey = jax.random.split(key)
-            kwargs_with_key = {**kwargs, 'key': subkey}
+            # Generate new keys for data sampling and model
+            key, data_key, model_key = jax.random.split(key, 3)
             
-            self.model, opt_state, loss = make_step(self.model, opt_state, **kwargs_with_key)
+            # Sample batch OUTSIDE JIT
+            batch_data = self.sample_batch(data_key, batch_size)
+            
+            self.model, opt_state, loss = train_step(self.model, opt_state, *batch_data, model_key)
             loss_val = float(loss)
             pbar.set_description(f'Epoch {epoch}, loss: {loss_val:.3f}')
             
