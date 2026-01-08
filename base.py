@@ -1,12 +1,11 @@
 from abc import ABC, abstractmethod
 from typing import Optional, Tuple
-import torch
-import torch.nn as nn
-from torch.func import vmap, jacrev
 from tqdm import tqdm
-from utils import model_size_b, MiB
 import jax
 import jax.numpy as jnp
+import equinox as eqx
+import optax
+from utils import model_size_b, MiB
 
 class Sampleable(ABC):
     """
@@ -282,38 +281,40 @@ class ConditionalVectorField(ABC):
 
 # Abstract class for training models
 class Trainer(ABC):
-    def __init__(self, model: nn.Module):
+    def __init__(self, model: eqx.Module):
         super().__init__()
         self.model = model
 
     @abstractmethod
-    def get_train_loss(self, **kwargs) -> torch.Tensor:
+    def get_train_loss(self, model: eqx.Module, **kwargs) -> jax.Array:
+        """Compute loss given a model. Must be a pure function."""
         pass
 
     def get_optimizer(self, lr: float):
-        return torch.optim.Adam(self.model.parameters(), lr=lr)
+        return optax.adam(lr)
 
-    def train(self, num_epochs: int, device: torch.device, lr: float = 1e-3, checkpoint_callback=None, **kwargs) -> torch.Tensor:
+    def train(self, num_epochs: int, lr: float = 1e-3, checkpoint_callback=None, **kwargs):
         # Report model size
         size_b = model_size_b(self.model)
         print(f'Training model with size: {size_b / MiB:.3f} MiB')
 
-        # Start
-        self.model.to(device)
+        # Initialize optimizer
         opt = self.get_optimizer(lr)
-        self.model.train()
+        opt_state = opt.init(eqx.filter(self.model, eqx.is_array))
+
+        @eqx.filter_jit
+        def make_step(model, opt_state, **loss_kwargs):
+            loss, grads = eqx.filter_value_and_grad(self.get_train_loss)(model, **loss_kwargs)
+            updates, opt_state = opt.update(grads, opt_state)
+            model = eqx.apply_updates(model, updates)
+            return model, opt_state, loss
 
         # Train loop
-        pbar = tqdm(enumerate(range(num_epochs)))
-        for idx, epoch in pbar:
-            opt.zero_grad()
-            loss = self.get_train_loss(**kwargs)
-            loss.backward()
-            opt.step()
-            pbar.set_description(f'Epoch {idx}, loss: {loss.item():.3f}')
+        pbar = tqdm(range(num_epochs))
+        for epoch in pbar:
+            self.model, opt_state, loss = make_step(self.model, opt_state, **kwargs)
+            loss_val = float(loss)
+            pbar.set_description(f'Epoch {epoch}, loss: {loss_val:.3f}')
             
             if checkpoint_callback is not None:
-                checkpoint_callback(epoch, self.model, opt, loss.item())
-
-        # Finish
-        self.model.eval()
+                checkpoint_callback(epoch, self.model, opt_state, loss_val)

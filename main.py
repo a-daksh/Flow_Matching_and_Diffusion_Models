@@ -6,21 +6,23 @@ from typing import Optional, Tuple
 from torchvision import datasets, transforms
 from torchvision.utils import make_grid
 from matplotlib import pyplot as plt
+import jax
+import jax.numpy as jnp
+import equinox as eqx
+import numpy as np
 
 from base import Sampleable, Trainer, ODE, ConditionalVectorField
 from probability_paths import GaussianConditionalProbabilityPath, LinearAlpha, LinearBeta
 from simulators import EulerSimulator, CFGVectorFieldODE
-from models import MNISTUNet
+from models import UNet
 from utils import visualize_probability_path
+import pickle
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-class MNISTSampler(nn.Module, Sampleable):
+class MNISTSampler(Sampleable):
     """
     Sampleable wrapper for the MNIST dataset
     """
     def __init__(self):
-        super().__init__()
         self.dataset = datasets.MNIST(
             root='./data',
             train=True,
@@ -31,11 +33,11 @@ class MNISTSampler(nn.Module, Sampleable):
                 transforms.Normalize((0.5,), (0.5,)),
             ])
         )
-        self.dummy = nn.Buffer(torch.zeros(1)) # Will automatically be moved when self.to(...) is called...
 
-    def sample(self, num_samples: int) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def sample(self, key: jax.random.PRNGKey, num_samples: int) -> Tuple[jax.Array, Optional[jax.Array]]:
         """
         Args:
+            - key: JAX PRNG key
             - num_samples: the desired number of samples
         Returns:
             - samples: shape (batch_size, c, h, w)
@@ -44,10 +46,15 @@ class MNISTSampler(nn.Module, Sampleable):
         if num_samples > len(self.dataset):
             raise ValueError(f"num_samples exceeds dataset size: {len(self.dataset)}")
 
-        indices = torch.randperm(len(self.dataset))[:num_samples]
-        samples, labels = zip(*[self.dataset[i] for i in indices])
-        samples = torch.stack(samples).to(self.dummy)
-        labels = torch.tensor(labels, dtype=torch.int64).to(self.dummy.device)
+        indices = jax.random.permutation(key, len(self.dataset))[:num_samples]
+        indices_np = jnp.asarray(indices)
+        samples, labels = zip(*[self.dataset[int(i)] for i in indices_np])
+        
+        samples_list = [jnp.array(sample.numpy()) for sample in samples]
+        samples = jnp.stack(samples_list)  # (batch_size, c, h, w)
+        
+        labels = jnp.array(labels, dtype=jnp.int32)  # (batch_size,)
+        
         return samples, labels
 class CFGTrainer(Trainer):
     def __init__(self, path: GaussianConditionalProbabilityPath, model: ConditionalVectorField, eta: float, **kwargs):
@@ -56,20 +63,33 @@ class CFGTrainer(Trainer):
         self.eta = eta
         self.path = path
 
-    def get_train_loss(self, batch_size: int) -> torch.Tensor:
+    def get_train_loss(self, model: eqx.Module, key: jax.random.PRNGKey, batch_size: int) -> jax.Array:
         # Step 1: Sample z,y from p_data
-        z,y=self.path.p_data.sample(batch_size)
+        key1, key2, key3, key4, key5 = jax.random.split(key, 5)
+        z, y = self.path.p_data.sample(key1, batch_size)
 
         # Step 2: Set each label to 10 (i.e., null) with probability eta
-        mask=torch.rand(batch_size)<self.eta
-        y[mask]=10
+        mask = jax.random.uniform(key2, shape=(batch_size,)) < self.eta
+        y = jnp.where(mask, 10, y)
 
         # Step 3: Sample t and x
-        t=torch.rand(batch_size,1,1,1, device= z.device)
-        x=self.path.sample_conditional_path(z,t)
+        t = jax.random.uniform(key3, shape=(batch_size, 1, 1, 1))
+        x = self.path.sample_conditional_path(z, t, key4)
 
-        # Step 4: Regress and output loss
-        loss=torch.nn.functional.mse_loss(self.model(x,t,y),  self.path.conditional_vector_field(x,z,t))
+        # UNet expects: (t_scalar, y_image, y_label, key) where y_image is (C, H, W), y_label is scalar
+        # Our interface: (x_image, t, y_label) where x is (C, H, W), t is (1,1,1), y is label scalar
+        def single_sample_model(x_i, t_i, y_i, key_i):
+            t_scalar = t_i[0, 0, 0]  # Extract scalar from (1,1,1) shape
+            # x_i is (C, H, W) - this becomes y_image in UNet
+            # y_i is label scalar (int) - pass directly to UNet
+            return model(t_scalar, x_i, y_i, key=key_i)
+        
+        vmapped_model = jax.vmap(single_sample_model, in_axes=(0, 0, 0, 0))
+        
+        model_keys = jax.random.split(key5, batch_size)        
+        pred = vmapped_model(x, t, y, model_keys)  # (batch_size, C, H, W)
+        target = self.path.conditional_vector_field(x, z, t)
+        loss = jnp.mean((pred - target) ** 2)
         return loss
 
 
@@ -81,14 +101,29 @@ def train(args):
         p_simple_shape = [1, 32, 32],
         alpha = LinearAlpha(),
         beta = LinearBeta()
-    ).to(device)
+    )
 
     # Initialize model
-    unet = MNISTUNet(
-        channels = args.channels,
-        num_residual_layers = args.num_residual_layers,
-        t_embed_dim = args.t_embed_dim,
-        y_embed_dim = args.y_embed_dim,
+    # Map old args to UNet parameters
+    # channels = [32, 64, 128] -> dim_mults = [2, 4] (relative to hidden_size)
+    # hidden_size = channels[0] = 32
+    # dim_mults = [c // hidden_size for c in channels[1:]] = [64//32, 128//32] = [2, 4]
+    hidden_size = args.channels[0] if args.channels else 32
+    dim_mults = [c // hidden_size for c in args.channels[1:]] if len(args.channels) > 1 else [2, 4]
+    
+    key = jax.random.PRNGKey(42)  # TODO: Do we want to make this configurable?
+    unet = UNet(
+        data_shape = (1, 32, 32),
+        is_biggan = False,
+        dim_mults = dim_mults,
+        hidden_size = hidden_size,
+        y_emb_dim = args.y_embed_dim,
+        heads = 4,
+        dim_head = 32,
+        dropout_rate = 0.1,
+        num_res_blocks = args.num_residual_layers,
+        attn_resolutions = [16],  # Attention at 16x16 resolution
+        key = key,
     )
 
     # Initialize trainer
@@ -97,7 +132,7 @@ def train(args):
     checkpoint_path = args.checkpoint_path
     checkpoint_every = args.checkpoint_every
     
-    def checkpoint_callback(epoch, model, optimizer, loss):
+    def checkpoint_callback(epoch, model, opt_state, loss):
         if epoch % checkpoint_every == 0 or epoch == args.num_epochs - 1:
             checkpoint_dir = os.path.dirname(checkpoint_path)
             if checkpoint_dir:
@@ -106,26 +141,34 @@ def train(args):
             checkpoint = {
                 'epoch': epoch,
                 'model_type': model.__class__.__name__,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
+                'model': model,
+                'opt_state': opt_state,
                 'loss': loss,
                 'model_config': {
-                    'channels': args.channels,
-                    'num_residual_layers': args.num_residual_layers,
-                    't_embed_dim': args.t_embed_dim,
-                    'y_embed_dim': args.y_embed_dim,
+                    'data_shape': (1, 32, 32),
+                    'is_biggan': False,
+                    'dim_mults': dim_mults,
+                    'hidden_size': hidden_size,
+                    'y_emb_dim': args.y_embed_dim,
+                    'heads': 4,
+                    'dim_head': 32,
+                    'dropout_rate': 0.1,
+                    'num_res_blocks': args.num_residual_layers,
+                    'attn_resolutions': [16],
                 }
             }
-            torch.save(checkpoint, checkpoint_path)
+            # Use pickle for Equinox models (or eqx.tree_serialise_leaves for more efficient binary format)
+            with open(checkpoint_path, 'wb') as f:
+                pickle.dump(checkpoint, f)
             print(f"\n !!Checkpoint saved at epoch {epoch} to {checkpoint_path}!!")
 
     # Train!
     trainer.train(
         num_epochs=args.num_epochs,
-        device=device,
         lr=args.lr,
-        batch_size=args.batch_size,
         checkpoint_callback=checkpoint_callback,
+        key=jax.random.PRNGKey(0),
+        batch_size=args.batch_size,
     )
     
     print(f"\nTraining completed! Checkpoints saved to {checkpoint_path}")
@@ -138,11 +181,10 @@ def visualize_path(args):
         p_simple_shape = [1, 32, 32],
         alpha = LinearAlpha(),
         beta = LinearBeta()
-    ).to(device)
+    )
     
     visualize_probability_path(
         path=path,
-        device=device,
         num_rows=args.vis_num_rows,
         num_cols=args.vis_num_cols,
         num_timesteps=args.vis_num_timesteps,
@@ -152,29 +194,20 @@ def visualize_path(args):
 def inference(args):
     """Inference/generation function"""
     # Load checkpoint
-    checkpoint = torch.load(args.checkpoint_path, map_location=device)
+    with open(args.checkpoint_path, 'rb') as f:
+        checkpoint = pickle.load(f)
+    
     model_config = checkpoint.get('model_config', {})
     model_type = checkpoint.get('model_type')
     
-    if model_type == 'MNISTUNet':
-        model = MNISTUNet(
-            channels = model_config.get('channels'),
-            num_residual_layers = model_config.get('num_residual_layers'),
-            t_embed_dim = model_config.get('t_embed_dim'),
-            y_embed_dim = model_config.get('y_embed_dim'),
-        )
-        # NOTE: Add more model types here as needed!
+    if model_type == 'UNet':
+        model = checkpoint['model']
     else:
         raise ValueError(f"Unknown model type: {model_type}")
-    
-    model.load_state_dict(checkpoint['model_state_dict'])
     
     epoch = checkpoint.get('epoch', 'unknown')
     loss = checkpoint.get('loss', 'unknown')
     print(f"Model {model_type} loaded from {args.checkpoint_path} (epoch {epoch}, loss: {loss:.4f})")
-    
-    model = model.to(device)
-    model.eval()
     
     # Initialize probability path
     path = GaussianConditionalProbabilityPath(
@@ -182,7 +215,7 @@ def inference(args):
         p_simple_shape = [1, 32, 32],
         alpha = LinearAlpha(),
         beta = LinearBeta()
-    ).to(device)
+    )
     
     samples_per_class = args.samples_per_class
     num_timesteps = args.num_timesteps
@@ -191,23 +224,61 @@ def inference(args):
     # Graph
     fig, axes = plt.subplots(1, len(guidance_scales), figsize=(10 * len(guidance_scales), 10))
 
+    # NOTE: Created a wrapper that implements ConditionalVectorField interface for UNet
+    # CFGVectorFieldODE expects batches (x, t, y) but UNet is single-sample
+    class UNetWrapper(ConditionalVectorField):
+        def __init__(self, unet_model, inference_key=None):
+            self.unet = unet_model
+            self.inference_key = inference_key
+        
+        def __call__(self, x: jax.Array, t: jax.Array, y: jax.Array) -> jax.Array:
+            """
+            Args:
+            - x: (bs, c, h, w)
+            - t: (bs, 1, 1, 1)
+            - y: (bs,)
+            Returns:
+            - u_t^theta(x|y): (bs, c, h, w)
+            """
+            def single_sample(x_i, t_i, y_i, key_i):
+                t_scalar = t_i[0, 0, 0]
+                return self.unet(t_scalar, x_i, y_i, key=key_i)
+            
+            vmapped_model = jax.vmap(single_sample, in_axes=(0, 0, 0, 0))
+            if self.inference_key is not None:
+                keys = jax.random.split(self.inference_key, x.shape[0])
+            else:
+                keys = jax.random.split(jax.random.PRNGKey(0), x.shape[0])
+            return vmapped_model(x, t, y, keys)
+    
+    # Use a fixed key for deterministic inference (dropout will be consistent)
+    inference_model_key = jax.random.PRNGKey(42)
+    wrapped_model = UNetWrapper(model, inference_key=inference_model_key)
+
     for idx, w in enumerate(guidance_scales):
         # Setup ode and simulator
-        ode = CFGVectorFieldODE(model, guidance_scale=w)
+        ode = CFGVectorFieldODE(wrapped_model, guidance_scale=w)
         simulator = EulerSimulator(ode)
 
         # Sample initial conditions
-        y = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10], dtype=torch.int64).repeat_interleave(samples_per_class).to(device)
+        y_labels = jnp.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10], dtype=jnp.int32)
+        y = jnp.repeat(y_labels, samples_per_class)  # (num_samples,)
         num_samples = y.shape[0]
-        x0, _ = path.p_simple.sample(num_samples) # (num_samples, 1, 32, 32)
+        
+        key = jax.random.PRNGKey(42)
+        x0, _ = path.p_simple.sample(key, num_samples)  # (num_samples, 1, 32, 32)
 
         # Simulate
-        ts = torch.linspace(0,1,num_timesteps).view(1, -1, 1, 1, 1).expand(num_samples, -1, 1, 1, 1).to(device)
-        x1 = simulator.simulate(x0, ts, y=y)
+        ts_base = jnp.linspace(0, 1, num_timesteps)  # (num_timesteps,)
+        ts = jnp.broadcast_to(ts_base[None, :, None, None, None], (num_samples, num_timesteps, 1, 1, 1))
+        
+        sim_key = jax.random.PRNGKey(0)
+        x1 = simulator.simulate(x0, ts, key=sim_key, y=y)  # (num_samples, 1, 32, 32)
 
         # Plot
-        grid = make_grid(x1, nrow=samples_per_class, normalize=True, value_range=(-1,1))
-        axes[idx].imshow(grid.permute(1, 2, 0).cpu(), cmap="gray")
+        x1_torch = torch.from_numpy(np.asarray(x1))
+        grid = make_grid(x1_torch, nrow=samples_per_class, normalize=True, value_range=(-1,1))
+        axes[idx].imshow(grid.permute(1, 2, 0).cpu().numpy(), cmap="gray")
         axes[idx].axis("off")
         axes[idx].set_title(f"Guidance: $w={w:.1f}$", fontsize=25)
     
