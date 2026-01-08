@@ -16,7 +16,6 @@ from probability_paths import GaussianConditionalProbabilityPath, LinearAlpha, L
 from simulators import EulerSimulator, CFGVectorFieldODE
 from models import UNet
 from utils import visualize_probability_path
-import pickle
 
 class MNISTSampler(Sampleable):
     """
@@ -142,7 +141,6 @@ def train(args):
             checkpoint = {
                 'epoch': epoch,
                 'model_type': model.__class__.__name__,
-                'model': model,
                 'opt_state': opt_state,
                 'loss': loss,
                 'model_config': {
@@ -158,9 +156,7 @@ def train(args):
                     'attn_resolutions': [16],
                 }
             }
-            # Use pickle for Equinox models (or eqx.tree_serialise_leaves for more efficient binary format)
-            with open(checkpoint_path, 'wb') as f:
-                pickle.dump(checkpoint, f)
+            eqx.tree_serialise_leaves(checkpoint_path, (checkpoint, model))
             print(f"\n !!Checkpoint saved at epoch {epoch} to {checkpoint_path}!!")
 
     # Train!
@@ -194,18 +190,35 @@ def visualize_path(args):
 
 def inference(args):
     """Inference/generation function"""
-    # Load checkpoint
-    with open(args.checkpoint_path, 'rb') as f:
-        checkpoint = pickle.load(f)
+    # We need to deserialize just the dict part first to read the config
+    dummy_model = None  # Placeholder for first deserialization
+    checkpoint_meta, _ = eqx.tree_deserialise_leaves(args.checkpoint_path, (dict, dummy_model))
     
-    model_config = checkpoint.get('model_config', {})
-    model_type = checkpoint.get('model_type')
+    # Extract model config from checkpoint
+    model_config = checkpoint_meta.get('model_config')
+    if model_config is None:
+        raise ValueError(f"Checkpoint at {args.checkpoint_path} is missing 'model_config'. ")
     
-    if model_type == 'UNet':
-        model = checkpoint['model']
-    else:
-        raise ValueError(f"Unknown model type: {model_type}")
+    print(f"Loading model with config: {model_config}")
     
+    init_key = jax.random.PRNGKey(0)
+    model_template = UNet(
+        data_shape=tuple(model_config['data_shape']),
+        is_biggan=model_config['is_biggan'],
+        dim_mults=model_config['dim_mults'],
+        hidden_size=model_config['hidden_size'],
+        y_emb_dim=model_config['y_emb_dim'],
+        heads=model_config['heads'],
+        dim_head=model_config['dim_head'],
+        dropout_rate=model_config['dropout_rate'],
+        num_res_blocks=model_config['num_res_blocks'],
+        attn_resolutions=model_config['attn_resolutions'],
+        key=init_key,
+    )
+    
+    checkpoint, model = eqx.tree_deserialise_leaves(args.checkpoint_path, (dict, model_template))
+    
+    model_type = checkpoint.get('model_type', 'UNet')
     epoch = checkpoint.get('epoch', 'unknown')
     loss = checkpoint.get('loss', 'unknown')
     print(f"Model {model_type} loaded from {args.checkpoint_path} (epoch {epoch}, loss: {loss:.4f})")
