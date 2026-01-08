@@ -309,10 +309,16 @@ class Trainer(ABC):
             model = eqx.apply_updates(model, updates)
             return model, opt_state, loss
 
+        key = kwargs.pop('key', jax.random.PRNGKey(0))
+        
         # Train loop
         pbar = tqdm(range(num_epochs))
         for epoch in pbar:
-            self.model, opt_state, loss = make_step(self.model, opt_state, **kwargs)
+            # Generate new key for each epoch
+            key, subkey = jax.random.split(key)
+            kwargs_with_key = {**kwargs, 'key': subkey}
+            
+            self.model, opt_state, loss = make_step(self.model, opt_state, **kwargs_with_key)
             loss_val = float(loss)
             pbar.set_description(f'Epoch {epoch}, loss: {loss_val:.3f}')
             

@@ -36,7 +36,10 @@ def visualize_probability_path(path, num_rows=3, num_cols=3, num_timesteps=5, ou
     """
     num_samples = num_rows * num_cols
     key = jax.random.PRNGKey(0)
-    z, _ = path.p_data.sample(key, num_samples)
+    
+    key, subkey = jax.random.split(key)
+    z, _ = path.p_data.sample(subkey, num_samples)
+    
     if num_timesteps == 1:
         fig, axes = plt.subplots(1, 1, figsize=(6 * num_cols, 6 * num_rows))
         axes = [axes]  # Make it iterable

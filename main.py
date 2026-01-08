@@ -111,7 +111,7 @@ def train(args):
     hidden_size = args.channels[0] if args.channels else 32
     dim_mults = [c // hidden_size for c in args.channels[1:]] if len(args.channels) > 1 else [2, 4]
     
-    key = jax.random.PRNGKey(42)  # TODO: Do we want to make this configurable?
+    init_key = jax.random.PRNGKey(args.seed)
     unet = UNet(
         data_shape = (1, 32, 32),
         is_biggan = False,
@@ -123,7 +123,7 @@ def train(args):
         dropout_rate = 0.1,
         num_res_blocks = args.num_residual_layers,
         attn_resolutions = [16],  # Attention at 16x16 resolution
-        key = key,
+        key = init_key,
     )
 
     # Initialize trainer
@@ -167,7 +167,7 @@ def train(args):
         num_epochs=args.num_epochs,
         lr=args.lr,
         checkpoint_callback=checkpoint_callback,
-        key=jax.random.PRNGKey(0),
+        key=jax.random.PRNGKey(args.seed + 1),
         batch_size=args.batch_size,
     )
     
@@ -226,10 +226,10 @@ def inference(args):
 
     # NOTE: Created a wrapper that implements ConditionalVectorField interface for UNet
     # CFGVectorFieldODE expects batches (x, t, y) but UNet is single-sample
+    # NOTE: We disable dropout during inference
     class UNetWrapper(ConditionalVectorField):
-        def __init__(self, unet_model, inference_key=None):
+        def __init__(self, unet_model):
             self.unet = unet_model
-            self.inference_key = inference_key
         
         def __call__(self, x: jax.Array, t: jax.Array, y: jax.Array) -> jax.Array:
             """
@@ -240,20 +240,14 @@ def inference(args):
             Returns:
             - u_t^theta(x|y): (bs, c, h, w)
             """
-            def single_sample(x_i, t_i, y_i, key_i):
+            def single_sample(x_i, t_i, y_i):
                 t_scalar = t_i[0, 0, 0]
-                return self.unet(t_scalar, x_i, y_i, key=key_i)
+                return eqx.nn.inference_mode(self.unet)(t_scalar, x_i, y_i, key=None)
             
-            vmapped_model = jax.vmap(single_sample, in_axes=(0, 0, 0, 0))
-            if self.inference_key is not None:
-                keys = jax.random.split(self.inference_key, x.shape[0])
-            else:
-                keys = jax.random.split(jax.random.PRNGKey(0), x.shape[0])
-            return vmapped_model(x, t, y, keys)
+            vmapped_model = jax.vmap(single_sample, in_axes=(0, 0, 0))
+            return vmapped_model(x, t, y)
     
-    # Use a fixed key for deterministic inference (dropout will be consistent)
-    inference_model_key = jax.random.PRNGKey(42)
-    wrapped_model = UNetWrapper(model, inference_key=inference_model_key)
+    wrapped_model = UNetWrapper(model)
 
     for idx, w in enumerate(guidance_scales):
         # Setup ode and simulator
@@ -297,6 +291,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=250, help="Batch size")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--eta", type=float, default=0.1, help="Label dropout probability for CFG")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--checkpoint_path", type=str, default="checkpoints/checkpoint.pth", help="Path to save/load model checkpoint")
     parser.add_argument("--checkpoint_every", type=int, default=100, help="Save checkpoint every N epochs")
     
