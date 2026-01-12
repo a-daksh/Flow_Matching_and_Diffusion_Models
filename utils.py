@@ -54,7 +54,7 @@ def visualize_probability_path(path, num_rows=3, num_cols=3, num_timesteps=5, ou
         xt = path.sample_conditional_path(z, tt, keys[tidx])  # (num_samples, 1, 32, 32)
         
         # NOTE: Convert JAX array to torch for make_grid (visualization only)
-        xt_torch = torch.from_numpy(np.asarray(xt))
+        xt_torch = torch.from_numpy(np.asarray(xt).copy())
         grid = make_grid(xt_torch, nrow=num_cols, normalize=True, value_range=(-1, 1))
         axes[tidx].imshow(grid.permute(1, 2, 0).cpu().numpy(), cmap="gray")
         axes[tidx].axis("off")

@@ -3,7 +3,6 @@ import argparse
 import json
 from datetime import datetime
 import torch
-import torch.nn as nn
 from typing import Optional, Tuple
 from torchvision.utils import make_grid
 from matplotlib import pyplot as plt
@@ -214,7 +213,7 @@ def visualize_path(args):
         num_rows=args.vis_num_rows,
         num_cols=args.vis_num_cols,
         num_timesteps=args.vis_num_timesteps,
-        output_path=args.output_path if hasattr(args, 'output_path') else None
+        output_path=os.path.join(args.output_dir, "probability_path.png") if hasattr(args, 'output_dir') else None
     )
 
 def inference(args):
@@ -249,6 +248,7 @@ def inference(args):
     model_type = checkpoint_meta.get('model_type', 'UNet')
     epoch = checkpoint_meta.get('epoch', 'unknown')
     loss = checkpoint_meta.get('loss', 'unknown')
+    timestamp = checkpoint_meta.get('timestamp', 'unknown')
     
     print(f"Loading model from {checkpoint_dir}")
     print(f"Config: epoch={epoch}, loss={loss:.4f}, model_type={model_type}")
@@ -336,15 +336,19 @@ def inference(args):
         x1 = simulator.simulate(x0, ts, key=sim_key, y=y)  # (num_samples, 1, 32, 32)
 
         # Plot
-        x1_torch = torch.from_numpy(np.asarray(x1))
+        x1_torch = torch.from_numpy(np.asarray(x1).copy())
         grid = make_grid(x1_torch, nrow=samples_per_class, normalize=True, value_range=(-1,1))
         axes[idx].imshow(grid.permute(1, 2, 0).cpu().numpy(), cmap="gray")
         axes[idx].axis("off")
         axes[idx].set_title(f"Guidance: $w={w:.1f}$", fontsize=25)
     
-    if args.output_path:
-        os.makedirs(os.path.dirname(args.output_path), exist_ok=True)
-        plt.savefig(args.output_path)
+    if args.output_dir:
+        os.makedirs(args.output_dir, exist_ok=True)
+        output_filename = f"inference_{timestamp}.png"
+        output_path = os.path.join(args.output_dir, output_filename)
+        plt.savefig(output_path)
+        print(f"Inference output saved to {output_path}")
+
     plt.show()
 
 
@@ -372,7 +376,7 @@ if __name__ == "__main__":
     parser.add_argument("--samples_per_class", type=int, default=10, help="Samples per class for inference")
     parser.add_argument("--num_timesteps", type=int, default=100, help="Number of timesteps for ODE integration")
     parser.add_argument("--guidance_scales", type=float, nargs="+", default=[1.0, 3.0, 5.0], help="Guidance scales to test")
-    parser.add_argument("--output_path", type=str, default="outputs/output.png", help="Path to save inference output image")
+    parser.add_argument("--output_dir", type=str, default="outputs", help="Directory to save output images")
     
     # Visualization args
     parser.add_argument("--vis_num_rows", type=int, default=3, help="Number of rows for probability path visualization")
@@ -381,8 +385,8 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
     
-    if args.mode == "inference" and not args.checkpoint_path:
-        parser.error("--checkpoint_path is required for inference mode")
+    # if args.mode == "inference" and not args.checkpoint_path:
+    #     parser.error("--checkpoint_path is required for inference mode")
     
     if args.mode == "train":
         train(args)
