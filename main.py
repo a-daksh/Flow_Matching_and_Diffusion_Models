@@ -27,7 +27,7 @@ class MNISTSampler(Sampleable):
     """
     Sampleable wrapper for the MNIST dataset
     """
-    def __init__(self):
+    def __init__(self, train_fraction: float = 1.0, seed: int = 42):
         print("Loading dataset...")
         # Load dataset as numpy arrays
         ds = tfds.load('fashion_mnist', split='train', as_supervised=True, batch_size=-1)
@@ -39,8 +39,16 @@ class MNISTSampler(Sampleable):
         images = images.astype(np.float32) / 255.0
         images = (images - 0.5) / 0.5
         
-        self.images = images  # (60000, 32, 32, 1) - NHWC format
-        self.labels = labels.astype(np.int32)  # (60000,)
+        # Shuffle data before taking fraction
+        full_size = len(images)
+        rng = np.random.default_rng(seed)
+        indices = rng.permutation(full_size)
+        
+        train_size = int(full_size * train_fraction)
+        selected_indices = indices[:train_size]
+        
+        self.images = images[selected_indices]  # (train_size, 32, 32, 1) - NHWC format
+        self.labels = labels[selected_indices].astype(np.int32)  # (train_size,)
         self.ds_size = len(self.images)
 
     def sample(self, key: jax.random.PRNGKey, num_samples: int) -> Tuple[jax.Array, Optional[jax.Array]]:
@@ -117,7 +125,7 @@ def train(args):
     """Training function"""
     # Initialize probability path
     path = GaussianConditionalProbabilityPath(
-        p_data = MNISTSampler(),
+        p_data = MNISTSampler(train_fraction=args.train_fraction, seed=args.seed),
         p_simple_shape = [1, 32, 32],
         alpha = LinearAlpha(),
         beta = LinearBeta()
@@ -359,25 +367,31 @@ def inference(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train or run inference on Flow/Diffusion models")
+    
     parser.add_argument("mode", choices=["train", "inference", "viz_path"], help="Mode: train, inference, or visualize-path")
+    parser.add_argument("--method", type=str, choices=["flow", "diffusion"], default="flow", help="Training method: flow matching or diffusion")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     
     # Training args
     parser.add_argument("--num_epochs", type=int, default=5000, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=250, help="Batch size")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
-    parser.add_argument("--eta", type=float, default=0.1, help="Label dropout probability for CFG")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
-    parser.add_argument("--checkpoint_base_dir", type=str, default="checkpoints", help="Base directory for checkpoints")
-    parser.add_argument("--checkpoint_path", type=str, required=False, help="Checkpoint folder name (required for inference)")
-    parser.add_argument("--checkpoint_every", type=int, default=100, help="Save checkpoint every N epochs")
-    parser.add_argument("--method", type=str, choices=["flow", "diffusion"], default="flow", help="Training method: flow matching or diffusion")
-    parser.add_argument("--sigma", type=float, default=1.0, help="Diffusion noise level (for diffusion models)")
     
     # Model args
     parser.add_argument("--channels", type=int, nargs="+", default=[32, 64, 128], help="U-Net channel sizes")
     parser.add_argument("--num_residual_layers", type=int, default=2, help="Number of residual layers")
     parser.add_argument("--t_embed_dim", type=int, default=40, help="Time embedding dimension")
     parser.add_argument("--y_embed_dim", type=int, default=40, help="Label embedding dimension")
+    
+    # Checkpoint args
+    parser.add_argument("--checkpoint_base_dir", type=str, default="checkpoints", help="Base directory for checkpoints")
+    parser.add_argument("--checkpoint_path", type=str, required=False, help="Checkpoint folder name (required for inference)")
+    parser.add_argument("--checkpoint_every", type=int, default=100, help="Save checkpoint every N epochs")
+    
+    # Tunables
+    parser.add_argument("--train_fraction", type=float, default=1.0, help="Fraction of training data to use (0-1) ")
+    parser.add_argument("--eta", type=float, default=0.1, help="Label dropout probability for CFG")
+    parser.add_argument("--sigma", type=float, default=1.0, help="Diffusion noise level (for diffusion models)")
     
     # Inference args
     parser.add_argument("--samples_per_class", type=int, default=10, help="Samples per class for inference")
