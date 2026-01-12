@@ -11,6 +11,12 @@ import jax.numpy as jnp
 import equinox as eqx
 import numpy as np
 
+# NOTE: Prevent TensorFlow from grabbing GPU memory
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+import tensorflow as tf
+tf.config.set_visible_devices([], 'GPU')
+import tensorflow_datasets as tfds
+
 from base import Sampleable, Trainer, ODE, ConditionalVectorField
 from probability_paths import GaussianConditionalProbabilityPath, LinearAlpha, LinearBeta
 from simulators import EulerSimulator, CFGVectorFieldODE
@@ -22,16 +28,20 @@ class MNISTSampler(Sampleable):
     Sampleable wrapper for the MNIST dataset
     """
     def __init__(self):
-        self.dataset = datasets.MNIST(
-            root='./data',
-            train=True,
-            download=True,
-            transform=transforms.Compose([
-                transforms.Resize((32, 32)),
-                transforms.ToTensor(),
-                transforms.Normalize((0.5,), (0.5,)),
-            ])
-        )
+        print("Loading dataset...")
+        # Load dataset as numpy arrays
+        ds = tfds.load('fashion_mnist', split='train', as_supervised=True, batch_size=-1)
+        ds = tfds.as_numpy(ds)
+        
+        images, labels = ds
+        # Preprocess: resize to 32x32 and normalize to [-1, 1]
+        images = tf.image.resize(images, [32, 32]).numpy()
+        images = images.astype(np.float32) / 255.0
+        images = (images - 0.5) / 0.5
+        
+        self.images = images  # (60000, 32, 32, 1) - NHWC format
+        self.labels = labels.astype(np.int32)  # (60000,)
+        self.ds_size = len(self.images)
 
     def sample(self, key: jax.random.PRNGKey, num_samples: int) -> Tuple[jax.Array, Optional[jax.Array]]:
         """
@@ -40,21 +50,24 @@ class MNISTSampler(Sampleable):
             - num_samples: the desired number of samples
         Returns:
             - samples: shape (batch_size, c, h, w)
-            - labels: shape (batch_size, label_dim)
+            - labels: shape (batch_size,)
         """
-        if num_samples > len(self.dataset):
-            raise ValueError(f"num_samples exceeds dataset size: {len(self.dataset)}")
+        if num_samples > self.ds_size:
+            raise ValueError(f"num_samples exceeds dataset size: {self.ds_size}")
 
-        indices = jax.random.permutation(key, len(self.dataset))[:num_samples]
-        indices_np = jnp.asarray(indices)
-        samples, labels = zip(*[self.dataset[int(i)] for i in indices_np])
+        rng = np.random.default_rng(int(key[0]))
+        indices = rng.choice(self.ds_size, size=num_samples, replace=False)
         
-        samples_list = [jnp.array(sample.numpy()) for sample in samples]
-        samples = jnp.stack(samples_list)  # (batch_size, c, h, w)
+        images_batch = self.images[indices]  # (batch_size, 32, 32, 1)
+        labels_batch = self.labels[indices]  # (batch_size,)
         
-        labels = jnp.array(labels, dtype=jnp.int32)  # (batch_size,)
+        # Convert batch to JAX (GPU)
+        images_jax = jnp.array(images_batch)
+        images_jax = jnp.transpose(images_jax, (0, 3, 1, 2))  # NHWC -> NCHW
+        labels_jax = jnp.array(labels_batch, dtype=jnp.int32)
         
-        return samples, labels
+        return images_jax, labels_jax
+
 class CFGTrainer(Trainer):
     def __init__(self, path: GaussianConditionalProbabilityPath, model: ConditionalVectorField, eta: float, **kwargs):
         assert eta > 0 and eta < 1
