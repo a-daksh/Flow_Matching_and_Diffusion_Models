@@ -1,9 +1,10 @@
 import os
 import argparse
+import json
+from datetime import datetime
 import torch
 import torch.nn as nn
 from typing import Optional, Tuple
-from torchvision import datasets, transforms
 from torchvision.utils import make_grid
 from matplotlib import pyplot as plt
 import jax
@@ -117,7 +118,6 @@ def train(args):
     )
 
     # Initialize model
-    # Map old args to UNet parameters
     # channels = [32, 64, 128] -> dim_mults = [2, 4] (relative to hidden_size)
     # hidden_size = channels[0] = 32
     # dim_mults = [c // hidden_size for c in channels[1:]] = [64//32, 128//32] = [2, 4]
@@ -142,35 +142,51 @@ def train(args):
     # Initialize trainer
     trainer = CFGTrainer(path=path, model=unet, eta=args.eta)
 
-    checkpoint_path = args.checkpoint_path
+    checkpoint_base_dir = args.checkpoint_base_dir
     checkpoint_every = args.checkpoint_every
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    checkpoint_dir = os.path.join(checkpoint_base_dir, f"checkpoint_{timestamp}")
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    print(f"Checkpoints will be saved to: {checkpoint_dir}")
     
     def checkpoint_callback(epoch, model, opt_state, loss):
         if epoch % checkpoint_every == 0 or epoch == args.num_epochs - 1:
-            checkpoint_dir = os.path.dirname(checkpoint_path)
-            if checkpoint_dir:
-                os.makedirs(checkpoint_dir, exist_ok=True)
+            # Prepare model config
+            model_config = {
+                'data_shape': (1, 32, 32),
+                'is_biggan': False,
+                'dim_mults': dim_mults,
+                'hidden_size': hidden_size,
+                'y_emb_dim': args.y_embed_dim,
+                'heads': 4,
+                'dim_head': 32,
+                'dropout_rate': 0.1,
+                'num_res_blocks': args.num_residual_layers,
+                'attn_resolutions': [16],
+            }
             
-            checkpoint = {
+            # Prepare checkpoint metadata
+            checkpoint_meta = {
                 'epoch': epoch,
                 'model_type': model.__class__.__name__,
-                'opt_state': opt_state,
-                'loss': loss,
-                'model_config': {
-                    'data_shape': (1, 32, 32),
-                    'is_biggan': False,
-                    'dim_mults': dim_mults,
-                    'hidden_size': hidden_size,
-                    'y_emb_dim': args.y_embed_dim,
-                    'heads': 4,
-                    'dim_head': 32,
-                    'dropout_rate': 0.1,
-                    'num_res_blocks': args.num_residual_layers,
-                    'attn_resolutions': [16],
-                }
+                'loss': float(loss),
+                'timestamp': timestamp,
+                'model_config': model_config
             }
-            eqx.tree_serialise_leaves(checkpoint_path, (checkpoint, model))
-            print(f"\n !!Checkpoint saved at epoch {epoch} to {checkpoint_path}!!")
+            
+            # Save model config as JSON (overwrites previous)
+            config_path = os.path.join(checkpoint_dir, 'config.json')
+            with open(config_path, 'w') as f:
+                json.dump(checkpoint_meta, f, indent=2)
+            
+            model_path = os.path.join(checkpoint_dir, 'model.pt')
+            eqx.tree_serialise_leaves(model_path, model)
+            
+            # opt_state_path = os.path.join(checkpoint_dir, 'opt_state.pt')
+            # eqx.tree_serialise_leaves(opt_state_path, opt_state)
+            
+            print(f"\n !!Checkpoint saved at epoch {epoch} to {checkpoint_dir}!!")
 
     # Train!
     trainer.train(
@@ -181,7 +197,7 @@ def train(args):
         batch_size=args.batch_size,
     )
     
-    print(f"\nTraining completed! Checkpoints saved to {checkpoint_path}")
+    print(f"\nTraining completed! Final checkpoint saved to {checkpoint_dir}")
 
 def visualize_path(args):
     """Visualize the probability path"""
@@ -203,16 +219,40 @@ def visualize_path(args):
 
 def inference(args):
     """Inference/generation function"""
-    # We need to deserialize just the dict part first to read the config
-    dummy_model = None  # Placeholder for first deserialization
-    checkpoint_meta, _ = eqx.tree_deserialise_leaves(args.checkpoint_path, (dict, dummy_model))
+    base_dir = args.checkpoint_base_dir
+    checkpoint_name = args.checkpoint_path
     
-    # Extract model config from checkpoint
-    model_config = checkpoint_meta.get('model_config')
-    if model_config is None:
-        raise ValueError(f"Checkpoint at {args.checkpoint_path} is missing 'model_config'. ")
+    # If checkpoint_path not provided, find latest
+    if checkpoint_name is None:
+        checkpoint_folders = [d for d in os.listdir(base_dir) 
+                            if os.path.isdir(os.path.join(base_dir, d)) 
+                            and d.startswith('checkpoint_')]
+        if not checkpoint_folders:
+            raise FileNotFoundError(f"No checkpoint folders found in {base_dir}")
+        checkpoint_folders.sort(key=lambda x: os.path.getmtime(os.path.join(base_dir, x)), reverse=True)
+        checkpoint_name = checkpoint_folders[0]
+        print(f"Using latest checkpoint: {checkpoint_name}")
     
-    print(f"Loading model with config: {model_config}")
+    checkpoint_dir = os.path.join(base_dir, checkpoint_name)
+    config_path = os.path.join(checkpoint_dir, 'config.json')
+    model_path = os.path.join(checkpoint_dir, 'model.pt')
+    
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model file not found: {model_path}")
+    
+    with open(config_path, 'r') as f:
+        checkpoint_meta = json.load(f)
+    
+    model_config = checkpoint_meta['model_config']
+    model_type = checkpoint_meta.get('model_type', 'UNet')
+    epoch = checkpoint_meta.get('epoch', 'unknown')
+    loss = checkpoint_meta.get('loss', 'unknown')
+    
+    print(f"Loading model from {checkpoint_dir}")
+    print(f"Config: epoch={epoch}, loss={loss:.4f}, model_type={model_type}")
+    print(f"Model config: {model_config}")
     
     init_key = jax.random.PRNGKey(0)
     model_template = UNet(
@@ -229,12 +269,11 @@ def inference(args):
         key=init_key,
     )
     
-    checkpoint, model = eqx.tree_deserialise_leaves(args.checkpoint_path, (dict, model_template))
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model file not found: {model_path}")
     
-    model_type = checkpoint.get('model_type', 'UNet')
-    epoch = checkpoint.get('epoch', 'unknown')
-    loss = checkpoint.get('loss', 'unknown')
-    print(f"Model {model_type} loaded from {args.checkpoint_path} (epoch {epoch}, loss: {loss:.4f})")
+    model = eqx.tree_deserialise_leaves(model_path, model_template)
+    print(f"Model loaded successfully!")
     
     # Initialize probability path
     path = GaussianConditionalProbabilityPath(
@@ -319,7 +358,8 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--eta", type=float, default=0.1, help="Label dropout probability for CFG")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
-    parser.add_argument("--checkpoint_path", type=str, default="checkpoints/checkpoint.pth", help="Path to save/load model checkpoint")
+    parser.add_argument("--checkpoint_base_dir", type=str, default="checkpoints", help="Base directory for checkpoints")
+    parser.add_argument("--checkpoint_path", type=str, default=None, help="Checkpoint folder name (if None, uses latest)")
     parser.add_argument("--checkpoint_every", type=int, default=100, help="Save checkpoint every N epochs")
     
     # Model args
