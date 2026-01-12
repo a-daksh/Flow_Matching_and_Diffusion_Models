@@ -19,7 +19,7 @@ import tensorflow_datasets as tfds
 
 from base import Sampleable, Trainer, ODE, ConditionalVectorField
 from probability_paths import GaussianConditionalProbabilityPath, LinearAlpha, LinearBeta
-from simulators import EulerSimulator, CFGVectorFieldODE
+from simulators import EulerSimulator, EulerMaruyamaSimulator, CFGVectorFieldODE, CFGScoreSDE
 from models import UNet
 from utils import visualize_probability_path
 
@@ -69,11 +69,12 @@ class MNISTSampler(Sampleable):
         return images_jax, labels_jax
 
 class CFGTrainer(Trainer):
-    def __init__(self, path: GaussianConditionalProbabilityPath, model: ConditionalVectorField, eta: float, **kwargs):
+    def __init__(self, path: GaussianConditionalProbabilityPath, model: ConditionalVectorField, eta: float, use_score: bool = False, **kwargs):
         assert eta > 0 and eta < 1
         super().__init__(model, **kwargs)
         self.eta = eta
         self.path = path
+        self.use_score = use_score
 
     def sample_batch(self, key: jax.random.PRNGKey, batch_size: int):
         # Step 1: Sample z,y from p_data
@@ -101,7 +102,13 @@ class CFGTrainer(Trainer):
         
         model_keys = jax.random.split(key, batch_size)        
         pred = vmapped_model(x, t, y, model_keys)  # (batch_size, C, H, W)
-        target = self.path.conditional_vector_field(x, z, t)
+        
+        # diffusion or flow matching
+        if self.use_score:
+            target = self.path.conditional_score(x, z, t)
+        else:
+            target = self.path.conditional_vector_field(x, z, t)
+        
         loss = jnp.mean((pred - target) ** 2)
         return loss
 
@@ -139,13 +146,20 @@ def train(args):
     )
 
     # Initialize trainer
-    trainer = CFGTrainer(path=path, model=unet, eta=args.eta)
+    if args.method == "flow":
+        trainer = CFGTrainer(path=path, model=unet, eta=args.eta, use_score=False)
+        print(f"Training Flow Matching model")
+    elif args.method == "diffusion":
+        trainer = CFGTrainer(path=path, model=unet, eta=args.eta, use_score=True)
+        print(f"Training Diffusion model")
+    else:
+        raise ValueError(f"Unknown method: {args.method}")
 
     checkpoint_base_dir = args.checkpoint_base_dir
     checkpoint_every = args.checkpoint_every
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    checkpoint_dir = os.path.join(checkpoint_base_dir, f"checkpoint_{timestamp}")
+    checkpoint_dir = os.path.join(checkpoint_base_dir, f"checkpoint_{args.method}_{timestamp}")
     os.makedirs(checkpoint_dir, exist_ok=True)
     print(f"Checkpoints will be saved to: {checkpoint_dir}")
     
@@ -169,6 +183,8 @@ def train(args):
             checkpoint_meta = {
                 'epoch': epoch,
                 'model_type': model.__class__.__name__,
+                'method': args.method,
+                'sigma': args.sigma,
                 'loss': float(loss),
                 'timestamp': timestamp,
                 'model_config': model_config
@@ -221,17 +237,6 @@ def inference(args):
     base_dir = args.checkpoint_base_dir
     checkpoint_name = args.checkpoint_path
     
-    # If checkpoint_path not provided, find latest
-    if checkpoint_name is None:
-        checkpoint_folders = [d for d in os.listdir(base_dir) 
-                            if os.path.isdir(os.path.join(base_dir, d)) 
-                            and d.startswith('checkpoint_')]
-        if not checkpoint_folders:
-            raise FileNotFoundError(f"No checkpoint folders found in {base_dir}")
-        checkpoint_folders.sort(key=lambda x: os.path.getmtime(os.path.join(base_dir, x)), reverse=True)
-        checkpoint_name = checkpoint_folders[0]
-        print(f"Using latest checkpoint: {checkpoint_name}")
-    
     checkpoint_dir = os.path.join(base_dir, checkpoint_name)
     config_path = os.path.join(checkpoint_dir, 'config.json')
     model_path = os.path.join(checkpoint_dir, 'model.pt')
@@ -245,13 +250,14 @@ def inference(args):
         checkpoint_meta = json.load(f)
     
     model_config = checkpoint_meta['model_config']
-    model_type = checkpoint_meta.get('model_type', 'UNet')
+    model_type = checkpoint_meta.get('model_type')
+    method = checkpoint_meta.get('method', 'flow')
     epoch = checkpoint_meta.get('epoch', 'unknown')
     loss = checkpoint_meta.get('loss', 'unknown')
     timestamp = checkpoint_meta.get('timestamp', 'unknown')
     
     print(f"Loading model from {checkpoint_dir}")
-    print(f"Config: epoch={epoch}, loss={loss:.4f}, model_type={model_type}")
+    print(f"Config: epoch={epoch}, loss={loss:.4f}, model_type={model_type}, method={method}")
     print(f"Model config: {model_config}")
     
     init_key = jax.random.PRNGKey(0)
@@ -274,14 +280,6 @@ def inference(args):
     
     model = eqx.tree_deserialise_leaves(model_path, model_template)
     print(f"Model loaded successfully!")
-    
-    # Initialize probability path
-    path = GaussianConditionalProbabilityPath(
-        p_data = MNISTSampler(),
-        p_simple_shape = [1, 32, 32],
-        alpha = LinearAlpha(),
-        beta = LinearBeta()
-    )
     
     samples_per_class = args.samples_per_class
     num_timesteps = args.num_timesteps
@@ -314,11 +312,18 @@ def inference(args):
             return vmapped_model(x, t, y)
     
     wrapped_model = UNetWrapper(model)
+    sigma = checkpoint_meta.get('sigma', 1.0)
 
     for idx, w in enumerate(guidance_scales):
         # Setup ode and simulator
-        ode = CFGVectorFieldODE(wrapped_model, guidance_scale=w)
-        simulator = EulerSimulator(ode)
+        if method == "flow":
+            ode = CFGVectorFieldODE(wrapped_model, guidance_scale=w)
+            simulator = EulerSimulator(ode)
+        elif method == "diffusion":
+            sde = CFGScoreSDE(wrapped_model, guidance_scale=w, sigma=sigma)
+            simulator = EulerMaruyamaSimulator(sde)
+        else:
+            raise ValueError(f"Unknown method: {method}")
 
         # Sample initial conditions
         y_labels = jnp.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10], dtype=jnp.int32)
@@ -326,7 +331,7 @@ def inference(args):
         num_samples = y.shape[0]
         
         key = jax.random.PRNGKey(42)
-        x0, _ = path.p_simple.sample(key, num_samples)  # (num_samples, 1, 32, 32)
+        x0 = jax.random.normal(key, shape=(num_samples, 1, 32, 32))
 
         # Simulate
         ts_base = jnp.linspace(0, 1, num_timesteps)  # (num_timesteps,)
@@ -363,8 +368,10 @@ if __name__ == "__main__":
     parser.add_argument("--eta", type=float, default=0.1, help="Label dropout probability for CFG")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--checkpoint_base_dir", type=str, default="checkpoints", help="Base directory for checkpoints")
-    parser.add_argument("--checkpoint_path", type=str, default=None, help="Checkpoint folder name (if None, uses latest)")
+    parser.add_argument("--checkpoint_path", type=str, required=False, help="Checkpoint folder name (required for inference)")
     parser.add_argument("--checkpoint_every", type=int, default=100, help="Save checkpoint every N epochs")
+    parser.add_argument("--method", type=str, choices=["flow", "diffusion"], default="flow", help="Training method: flow matching or diffusion")
+    parser.add_argument("--sigma", type=float, default=1.0, help="Diffusion noise level (for diffusion models)")
     
     # Model args
     parser.add_argument("--channels", type=int, nargs="+", default=[32, 64, 128], help="U-Net channel sizes")
@@ -385,8 +392,8 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
     
-    # if args.mode == "inference" and not args.checkpoint_path:
-    #     parser.error("--checkpoint_path is required for inference mode")
+    if args.mode == "inference" and not args.checkpoint_path:
+        parser.error("--checkpoint_path is required for inference mode")
     
     if args.mode == "train":
         train(args)
