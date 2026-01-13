@@ -1,5 +1,4 @@
 __pycache__/
 *.pth
 checkpoints/
-outputs/
 data/
