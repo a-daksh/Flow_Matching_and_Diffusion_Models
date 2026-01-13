@@ -167,7 +167,8 @@ def train(args):
     checkpoint_every = args.checkpoint_every
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    checkpoint_dir = os.path.join(checkpoint_base_dir, f"checkpoint_{args.method}_{timestamp}")
+    postfix = args.postfix if args.postfix else timestamp
+    checkpoint_dir = os.path.join(checkpoint_base_dir, f"checkpoint_{args.method}_{postfix}")
     os.makedirs(checkpoint_dir, exist_ok=True)
     print(f"Checkpoints will be saved to: {checkpoint_dir}")
     
@@ -262,7 +263,12 @@ def inference(args):
     method = checkpoint_meta.get('method', 'flow')
     epoch = checkpoint_meta.get('epoch', 'unknown')
     loss = checkpoint_meta.get('loss', 'unknown')
-    timestamp = checkpoint_meta.get('timestamp', 'unknown')
+    
+    prefix = f"checkpoint_{method}_"
+    if checkpoint_name.startswith(prefix):
+        postfix = checkpoint_name[len(prefix):]
+    else:
+        postfix = checkpoint_name
     
     print(f"Loading model from {checkpoint_dir}")
     print(f"Config: epoch={epoch}, loss={loss:.4f}, model_type={model_type}, method={method}")
@@ -357,7 +363,7 @@ def inference(args):
     
     if args.output_dir:
         os.makedirs(args.output_dir, exist_ok=True)
-        output_filename = f"inference_{timestamp}.png"
+        output_filename = f"inference_{method}_{postfix}.png"
         output_path = os.path.join(args.output_dir, output_filename)
         plt.savefig(output_path)
         print(f"Inference output saved to {output_path}")
@@ -386,6 +392,7 @@ if __name__ == "__main__":
     # Checkpoint args
     parser.add_argument("--checkpoint_base_dir", type=str, default="checkpoints", help="Base directory for checkpoints")
     parser.add_argument("--checkpoint_path", type=str, required=False, help="Checkpoint folder name (required for inference)")
+    parser.add_argument("--postfix", type=str, required=False, help=f"Checkpoint folder name; will be saved as checkpoint_method_postfix")
     parser.add_argument("--checkpoint_every", type=int, default=100, help="Save checkpoint every N epochs")
     
     # Tunables
