@@ -1,6 +1,7 @@
 import os
 import argparse
 import json
+import random
 from datetime import datetime
 import torch
 from typing import Optional, Tuple
@@ -19,7 +20,7 @@ import tensorflow_datasets as tfds
 
 from base import Sampleable, Trainer, ODE, ConditionalVectorField
 from probability_paths import GaussianConditionalProbabilityPath, LinearAlpha, LinearBeta
-from simulators import EulerSimulator, EulerMaruyamaSimulator, CFGVectorFieldODE, CFGScoreSDE
+from simulators import EulerSimulator, EulerMaruyamaSimulator, CFGVectorFieldODE, CFGFlowSDE
 from models import UNet
 from utils import visualize_probability_path
 
@@ -77,12 +78,11 @@ class MNISTSampler(Sampleable):
         return images_jax, labels_jax
 
 class CFGTrainer(Trainer):
-    def __init__(self, path: GaussianConditionalProbabilityPath, model: ConditionalVectorField, eta: float, use_score: bool = False, **kwargs):
+    def __init__(self, path: GaussianConditionalProbabilityPath, model: ConditionalVectorField, eta: float, **kwargs):
         assert eta > 0 and eta < 1
         super().__init__(model, **kwargs)
         self.eta = eta
         self.path = path
-        self.use_score = use_score
 
     def sample_batch(self, key: jax.random.PRNGKey, batch_size: int):
         # Step 1: Sample z,y from p_data
@@ -94,7 +94,7 @@ class CFGTrainer(Trainer):
         y = jnp.where(mask, 10, y)
 
         # Step 3: Sample t and x
-        t = jax.random.uniform(key3, shape=(batch_size, 1, 1, 1))
+        t = jax.random.uniform(key3, shape=(batch_size, 1, 1, 1), minval=0.001, maxval=0.999)
         x = self.path.sample_conditional_path(z, t, key4)
         
         return x, z, t, y
@@ -111,11 +111,7 @@ class CFGTrainer(Trainer):
         model_keys = jax.random.split(key, batch_size)        
         pred = vmapped_model(x, t, y, model_keys)  # (batch_size, C, H, W)
         
-        # diffusion or flow matching
-        if self.use_score:
-            target = self.path.conditional_score(x, z, t)
-        else:
-            target = self.path.conditional_vector_field(x, z, t)
+        target = self.path.conditional_vector_field(x, z, t)
         
         loss = jnp.mean((pred - target) ** 2)
         return loss
@@ -125,7 +121,8 @@ def train(args):
     """Training function"""
     # Initialize probability path
     path = GaussianConditionalProbabilityPath(
-        p_data = MNISTSampler(train_fraction=args.train_fraction, seed=args.seed),
+        # TODO: Do we want to be able to control this seed?
+        p_data = MNISTSampler(train_fraction=args.train_fraction, seed=42),
         p_simple_shape = [1, 32, 32],
         alpha = LinearAlpha(),
         beta = LinearBeta()
@@ -138,7 +135,8 @@ def train(args):
     hidden_size = args.channels[0] if args.channels else 32
     dim_mults = [c // hidden_size for c in args.channels[1:]] if len(args.channels) > 1 else [2, 4]
     
-    init_key = jax.random.PRNGKey(args.seed)
+    # TODO: Do we want to be able to control this?
+    init_key = jax.random.PRNGKey(42)
     unet = UNet(
         data_shape = (1, 32, 32),
         is_biggan = False,
@@ -153,22 +151,15 @@ def train(args):
         key = init_key,
     )
 
-    # Initialize trainer
-    if args.method == "flow":
-        trainer = CFGTrainer(path=path, model=unet, eta=args.eta, use_score=False)
-        print(f"Training Flow Matching model")
-    elif args.method == "diffusion":
-        trainer = CFGTrainer(path=path, model=unet, eta=args.eta, use_score=True)
-        print(f"Training Diffusion model")
-    else:
-        raise ValueError(f"Unknown method: {args.method}")
+    trainer = CFGTrainer(path=path, model=unet, eta=args.eta)
+    print(f"Training Flow model")
 
     checkpoint_base_dir = args.checkpoint_base_dir
     checkpoint_every = args.checkpoint_every
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     postfix = args.postfix if args.postfix else timestamp
-    checkpoint_dir = os.path.join(checkpoint_base_dir, f"checkpoint_{args.method}_{postfix}")
+    checkpoint_dir = os.path.join(checkpoint_base_dir, f"checkpoint_{postfix}")
     os.makedirs(checkpoint_dir, exist_ok=True)
     print(f"Checkpoints will be saved to: {checkpoint_dir}")
     
@@ -192,8 +183,6 @@ def train(args):
             checkpoint_meta = {
                 'epoch': epoch,
                 'model_type': model.__class__.__name__,
-                'method': args.method,
-                'sigma': args.sigma,
                 'loss': float(loss),
                 'timestamp': timestamp,
                 'model_config': model_config
@@ -217,7 +206,8 @@ def train(args):
         num_epochs=args.num_epochs,
         lr=args.lr,
         checkpoint_callback=checkpoint_callback,
-        key=jax.random.PRNGKey(args.seed + 1),
+        # TODO: Do we want to be able to control this?
+        key=jax.random.PRNGKey(43),
         batch_size=args.batch_size,
     )
     
@@ -260,18 +250,17 @@ def inference(args):
     
     model_config = checkpoint_meta['model_config']
     model_type = checkpoint_meta.get('model_type')
-    method = checkpoint_meta.get('method', 'flow')
     epoch = checkpoint_meta.get('epoch', 'unknown')
     loss = checkpoint_meta.get('loss', 'unknown')
     
-    prefix = f"checkpoint_{method}_"
+    prefix = "checkpoint_"
     if checkpoint_name.startswith(prefix):
         postfix = checkpoint_name[len(prefix):]
     else:
         postfix = checkpoint_name
     
     print(f"Loading model from {checkpoint_dir}")
-    print(f"Config: epoch={epoch}, loss={loss:.4f}, model_type={model_type}, method={method}")
+    print(f"Config: epoch={epoch}, loss={loss:.4f}, model_type={model_type}")
     print(f"Model config: {model_config}")
     
     init_key = jax.random.PRNGKey(0)
@@ -326,32 +315,42 @@ def inference(args):
             return vmapped_model(x, t, y)
     
     wrapped_model = UNetWrapper(model)
-    sigma = checkpoint_meta.get('sigma', 1.0)
 
     for idx, w in enumerate(guidance_scales):
-        # Setup ode and simulator
-        if method == "flow":
+        if args.stochastic:
+            # derive score from flow model for stochastic sampling
+            sde = CFGFlowSDE(wrapped_model, LinearAlpha(), LinearBeta(), guidance_scale=w, sigma=args.sigma)
+            simulator = EulerMaruyamaSimulator(sde)
+            if idx == 0:
+                print(f"Using stochastic SDE sampling (sigma={args.sigma})")
+        else:
             ode = CFGVectorFieldODE(wrapped_model, guidance_scale=w)
             simulator = EulerSimulator(ode)
-        elif method == "diffusion":
-            sde = CFGScoreSDE(wrapped_model, guidance_scale=w, sigma=sigma)
-            simulator = EulerMaruyamaSimulator(sde)
-        else:
-            raise ValueError(f"Unknown method: {method}")
+            if idx == 0:
+                print(f"Using deterministic ODE sampling")
 
         # Sample initial conditions
         y_labels = jnp.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10], dtype=jnp.int32)
         y = jnp.repeat(y_labels, samples_per_class)  # (num_samples,)
         num_samples = y.shape[0]
         
-        key = jax.random.PRNGKey(42)
-        x0 = jax.random.normal(key, shape=(num_samples, 1, 32, 32))
+        # TODO: Do we want to make this controllable?
+        x0_key = jax.random.PRNGKey(42)
+        x0 = jax.random.normal(x0_key, shape=(num_samples, 1, 32, 32))
 
         # Simulate
-        ts_base = jnp.linspace(0, 1, num_timesteps)  # (num_timesteps,)
+        ts_base = jnp.linspace(0.001, 0.999, num_timesteps)
         ts = jnp.broadcast_to(ts_base[None, :, None, None, None], (num_samples, num_timesteps, 1, 1, 1))
         
-        sim_key = jax.random.PRNGKey(0)
+        if args.seed is not None:
+            sim_seed = args.seed
+        elif args.stochastic:
+            sim_seed = random.randint(0, 2**31 - 1)
+            print(f"Using random seed for stochastic SDE sampling: {sim_seed}")
+        else:
+            sim_seed = 42
+        
+        sim_key = jax.random.PRNGKey(sim_seed)
         x1 = simulator.simulate(x0, ts, key=sim_key, y=y)  # (num_samples, 1, 32, 32)
 
         # Plot
@@ -363,7 +362,8 @@ def inference(args):
     
     if args.output_dir:
         os.makedirs(args.output_dir, exist_ok=True)
-        output_filename = f"inference_{method}_{postfix}.png"
+        mode = f"sde_sigma{args.sigma}" if args.stochastic else "ode"
+        output_filename = f"inference_{mode}_{postfix}.png"
         output_path = os.path.join(args.output_dir, output_filename)
         plt.savefig(output_path)
         print(f"Inference output saved to {output_path}")
@@ -375,8 +375,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train or run inference on Flow/Diffusion models")
     
     parser.add_argument("mode", choices=["train", "inference", "viz_path"], help="Mode: train, inference, or visualize-path")
-    parser.add_argument("--method", type=str, choices=["flow", "diffusion"], default="flow", help="Training method: flow matching or diffusion")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed for SDE simulation. If not provided, uses random seed when stochastic.")
     
     # Training args
     parser.add_argument("--num_epochs", type=int, default=5000, help="Number of training epochs")
@@ -392,19 +391,20 @@ if __name__ == "__main__":
     # Checkpoint args
     parser.add_argument("--checkpoint_base_dir", type=str, default="checkpoints", help="Base directory for checkpoints")
     parser.add_argument("--checkpoint_path", type=str, required=False, help="Checkpoint folder name (required for inference)")
-    parser.add_argument("--postfix", type=str, required=False, help=f"Checkpoint folder name; will be saved as checkpoint_method_postfix")
+    parser.add_argument("--postfix", type=str, required=False, help="Checkpoint folder postfix; will be saved as checkpoint_<postfix>")
     parser.add_argument("--checkpoint_every", type=int, default=100, help="Save checkpoint every N epochs")
     
-    # Tunables
+    # Training tunables
     parser.add_argument("--train_fraction", type=float, default=1.0, help="Fraction of training data to use (0-1) ")
     parser.add_argument("--eta", type=float, default=0.1, help="Label dropout probability for CFG")
-    parser.add_argument("--sigma", type=float, default=1.0, help="Diffusion noise level (for diffusion models)")
     
     # Inference args
     parser.add_argument("--samples_per_class", type=int, default=10, help="Samples per class for inference")
-    parser.add_argument("--num_timesteps", type=int, default=100, help="Number of timesteps for ODE integration")
+    parser.add_argument("--num_timesteps", type=int, default=100, help="Number of timesteps for ODE/SDE integration")
     parser.add_argument("--guidance_scales", type=float, nargs="+", default=[1.0, 3.0, 5.0], help="Guidance scales to test")
     parser.add_argument("--output_dir", type=str, default="outputs", help="Directory to save output images")
+    parser.add_argument("--stochastic", action="store_true", help="Use stochastic SDE sampling (derives score from flow)")
+    parser.add_argument("--sigma", type=float, default=0.1, help="Noise level for stochastic SDE sampling (only used with --stochastic)")
     
     # Visualization args
     parser.add_argument("--vis_num_rows", type=int, default=3, help="Number of rows for probability path visualization")
