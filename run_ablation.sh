@@ -1,66 +1,38 @@
 #!/bin/bash
-
-# Ablation Study Script for Flow Matching
-# This script trains models with different data fractions and runs inference with
-# different guidance scales and number of steps.
-#
-# Usage:
-#   ./run_ablation.sh                    # Run full ablation (training + inference)
-#   ./run_ablation.sh train              # Only train models
-#   ./run_ablation.sh inference          # Only run inference (assumes models are trained)
-
-set -e  # Exit on error
+set -e
 
 # Configuration
-METHOD="flow"
 BASE_DIR="checkpoints"
 OUTPUT_DIR="outputs"
-SEED=42
 NUM_EPOCHS=5000
 BATCH_SIZE=250
 LR=1e-3
 ETA=0.1
 
-DATA_FRACTIONS=(0.1 0.25 0.5 1.0)
-
-GUIDANCE_SCALES=(0.5 1.0 2.0 3.0 5.0)
-
-INFERENCE_STEPS=(10 25 50 100 200)
-
+DATA_FRACTIONS=(0.1 0.25 0.5 0.75 1.0)
+GUIDANCE_SCALES_STUDY_B=(0.5 1.0 2.0 3.0 5.0)
+INFERENCE_STEPS_STUDY_B=(10 25 50 100 200)
+SIGMA_VALUES=(0 0.1 0.2 0.5 1.0)
 SAMPLES_PER_CLASS=10
 
-MODE="${1:-all}"  # Default to "all" if no argument provided
+MODE="${1:-all}"
 
 echo "=========================================="
-echo "Flow Matching Ablation Study"
+echo "Modepleple: ${MODE}"
 echo "=========================================="
-echo "Mode: ${MODE}"
-echo "Data fractions: ${DATA_FRACTIONS[@]}"
-echo "Guidance scales: ${GUIDANCE_SCALES[@]}"
-echo "Inference steps: ${INFERENCE_STEPS[@]}"
-echo "=========================================="
-echo ""
-# Parse command line argument
 
-# Create output directory
 mkdir -p ${OUTPUT_DIR}
 
 # ==========================================
-# PHASE 1: TRAINING
+# TRAINING: 5 models with different data fractions
 # ==========================================
 if [ "${MODE}" == "all" ] || [ "${MODE}" == "train" ]; then
-    echo "PHASE 1: Training models with different data fractions..."
-    echo ""
+    echo "Training models..."
     
     for frac in "${DATA_FRACTIONS[@]}"; do
-        # Create descriptive postfix
-        postfix="data_frac_${frac}"
-        
-        echo "Training model with data fraction: ${frac} (postfix: ${postfix})"
+        postfix="frac_${frac}"
         
         python main.py train \
-            --method ${METHOD} \
-            --seed ${SEED} \
             --num_epochs ${NUM_EPOCHS} \
             --batch_size ${BATCH_SIZE} \
             --lr ${LR} \
@@ -70,76 +42,142 @@ if [ "${MODE}" == "all" ] || [ "${MODE}" == "train" ]; then
             --postfix ${postfix} \
             --checkpoint_every 100
         
-        echo "✓ Completed training for data fraction ${frac}"
-        echo ""
+        echo "✓ Trained: ${postfix}"
     done
     
-    echo "=========================================="
-    echo "All training completed!"
-    echo "=========================================="
+    echo "Training complete"
     echo ""
 fi
 
 # ==========================================
-# PHASE 2: INFERENCE
+# STUDY A: Data Fraction Effect
+# Baseline inference on all 5 models (flow only, w=3.0, steps=100)
 # ==========================================
-if [ "${MODE}" == "all" ] || [ "${MODE}" == "inference" ]; then
-    echo "PHASE 2: Running inference with different configurations..."
-    echo ""
+if [ "${MODE}" == "all" ] || [ "${MODE}" == "study_a" ]; then
+    echo "Study A: Data Fraction Effect"
+    
+    output_subdir="${OUTPUT_DIR}/study_a_data_fraction"
+    mkdir -p ${output_subdir}
     
     for frac in "${DATA_FRACTIONS[@]}"; do
-        postfix="data_frac_${frac}"
-        checkpoint_path="checkpoint_${METHOD}_${postfix}"
+        postfix="frac_${frac}"
+        checkpoint_path="checkpoint_${postfix}"
         
-        # Check if checkpoint exists
-        checkpoint_dir="${BASE_DIR}/${checkpoint_path}"
-        if [ ! -f "${checkpoint_dir}/model.pt" ]; then
-            echo "⚠ Warning: Checkpoint not found: ${checkpoint_path}"
-            echo "  Skipping inference for this model."
-            echo ""
+        if [ ! -f "${BASE_DIR}/${checkpoint_path}/model.pt" ]; then
+            echo "⚠ Checkpoint not found: ${checkpoint_path}"
             continue
         fi
         
-        echo "Processing model: ${checkpoint_path}"
+        python main.py inference \
+            --checkpoint_path ${checkpoint_path} \
+            --checkpoint_base_dir ${BASE_DIR} \
+            --num_timesteps 100 \
+            --guidance_scales 3.0 \
+            --samples_per_class ${SAMPLES_PER_CLASS} \
+            --output_dir ${output_subdir}
         
-        # Create output subdirectory for this data fraction
-        output_subdir="${OUTPUT_DIR}/${postfix}"
-        mkdir -p ${output_subdir}
-        
-        # Test different number of inference steps
-        for steps in "${INFERENCE_STEPS[@]}"; do
-            echo "  Running inference with ${steps} steps..."
-            
-            # Run inference with all guidance scales
-            # Note: plt.show() will be called but won't block in non-interactive mode
-            python main.py inference \
-                --checkpoint_path ${checkpoint_path} \
-                --checkpoint_base_dir ${BASE_DIR} \
-                --num_timesteps ${steps} \
-                --guidance_scales ${GUIDANCE_SCALES[@]} \
-                --samples_per_class ${SAMPLES_PER_CLASS} \
-                --output_dir ${output_subdir} 2>&1 | grep -v "UserWarning\|matplotlib" || true
-            
-            # The output will be saved as: inference_${METHOD}_${postfix}.png
-            # Rename to include step count for better organization
-            original_file="${output_subdir}/inference_${METHOD}_${postfix}.png"
-            new_file="${output_subdir}/inference_steps_${steps}.png"
-            
-            if [ -f "${original_file}" ]; then
-                mv "${original_file}" "${new_file}"
-                echo "    ✓ Saved to ${new_file}"
-            else
-                echo "    ⚠ Warning: Expected output file not found: ${original_file}"
-            fi
-        done
-        
-        echo "  ✓ Completed inference for ${checkpoint_path}"
-        echo ""
+        echo "✓ Study A: frac=${frac}"
     done
     
-    echo "=========================================="
-    echo "All inference completed!"
-    echo "=========================================="
+    echo "Study A complete"
     echo ""
 fi
 
+# ==========================================
+# STUDY B: Flow Parameters (Guidance + Steps)
+# Deep dive on frac=1.0 model
+# ==========================================
+if [ "${MODE}" == "all" ] || [ "${MODE}" == "study_b" ]; then
+    echo "Study B: Flow Parameters (Guidance + Steps)"
+    
+    postfix="frac_1.0"
+    checkpoint_path="checkpoint_${postfix}"
+    output_subdir="${OUTPUT_DIR}/study_b_flow_params"
+    mkdir -p ${output_subdir}
+    
+    if [ ! -f "${BASE_DIR}/${checkpoint_path}/model.pt" ]; then
+        echo "⚠ Checkpoint not found: ${checkpoint_path}"
+    else
+        for w in "${GUIDANCE_SCALES_STUDY_B[@]}"; do
+            for steps in "${INFERENCE_STEPS_STUDY_B[@]}"; do
+                python main.py inference \
+                    --checkpoint_path ${checkpoint_path} \
+                    --checkpoint_base_dir ${BASE_DIR} \
+                    --num_timesteps ${steps} \
+                    --guidance_scales ${w} \
+                    --samples_per_class ${SAMPLES_PER_CLASS} \
+                    --output_dir ${output_subdir}
+                
+                original_file="${output_subdir}/inference_ode_${postfix}.png"
+                new_file="${output_subdir}/inference_ode_w${w}_steps${steps}_${postfix}.png"
+                
+                if [ -f "${original_file}" ]; then
+                    mv "${original_file}" "${new_file}"
+                fi
+                
+                echo "✓ Study B: w=${w}, steps=${steps}"
+            done
+        done
+    fi
+    
+    echo "Study B complete"
+    echo ""
+fi
+
+# ==========================================
+# STUDY C: Diffusion Sigma Effect
+# Deep dive on frac=1.0 model (guidance=3.0, steps=100, vary sigma)
+# ==========================================
+if [ "${MODE}" == "all" ] || [ "${MODE}" == "study_c" ]; then
+    echo "Study C: Diffusion Sigma Effect"
+    
+    postfix="frac_1.0"
+    checkpoint_path="checkpoint_${postfix}"
+    output_subdir="${OUTPUT_DIR}/study_c_diffusion_sigma"
+    mkdir -p ${output_subdir}
+    
+    if [ ! -f "${BASE_DIR}/${checkpoint_path}/model.pt" ]; then
+        echo "⚠ Checkpoint not found: ${checkpoint_path}"
+    else
+        for sigma in "${SIGMA_VALUES[@]}"; do
+            if [ "${sigma}" == "0" ]; then
+                python main.py inference \
+                    --checkpoint_path ${checkpoint_path} \
+                    --checkpoint_base_dir ${BASE_DIR} \
+                    --num_timesteps 100 \
+                    --guidance_scales 3.0 \
+                    --samples_per_class ${SAMPLES_PER_CLASS} \
+                    --output_dir ${output_subdir}
+                
+                original_file="${output_subdir}/inference_ode_${postfix}.png"
+                new_file="${output_subdir}/inference_sigma${sigma}_${postfix}.png"
+            else
+                python main.py inference \
+                    --checkpoint_path ${checkpoint_path} \
+                    --checkpoint_base_dir ${BASE_DIR} \
+                    --num_timesteps 100 \
+                    --guidance_scales 3.0 \
+                    --samples_per_class ${SAMPLES_PER_CLASS} \
+                    --stochastic \
+                    --sigma ${sigma} \
+                    --output_dir ${output_subdir}
+                
+                original_file="${output_subdir}/inference_sde_sigma${sigma}_${postfix}.png"
+                new_file="${output_subdir}/inference_sigma${sigma}_${postfix}.png"
+            fi
+            
+            if [ -f "${original_file}" ]; then
+                mv "${original_file}" "${new_file}"
+            fi
+            
+            echo "✓ Study C: sigma=${sigma}"
+        done
+    fi
+    
+    echo "Study C complete"
+    echo ""
+fi
+
+echo "=========================================="
+echo "All studies complete"
+echo "=========================================="
