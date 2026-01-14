@@ -290,6 +290,8 @@ def inference(args):
 
     # Graph
     fig, axes = plt.subplots(1, len(guidance_scales), figsize=(10 * len(guidance_scales), 10))
+    if len(guidance_scales) == 1:
+        axes = [axes]
 
     # NOTE: Created a wrapper that implements ConditionalVectorField interface for UNet
     # CFGVectorFieldODE expects batches (x, t, y) but UNet is single-sample
